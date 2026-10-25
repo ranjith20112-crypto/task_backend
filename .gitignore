@@ -3,4 +3,3 @@ node_modules/
 .env.backup
 src/config/.env
 uploads/
-models/
