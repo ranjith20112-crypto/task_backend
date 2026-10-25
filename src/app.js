@@ -40,7 +40,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const allowedOrigins = [
   "https://task-backend-mn8a.onrender.com",
-  "http://localhost:5173",
+  "https://ranjith20112-crypto-taskfrontend.vercel.app/",
 ];
 
 // ==================== SOCKET.IO ====================
