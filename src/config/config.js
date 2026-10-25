@@ -1,7 +1,7 @@
 import axios from "axios";
 
 const API = axios.create({
-  baseURL: "http://localhost:5000",
+  baseURL: "https://task-backend-mn8a.onrender.com",
 });
 
 // ✅ FIX 1: Attach token to EVERY request automatically
