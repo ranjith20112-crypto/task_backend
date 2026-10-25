@@ -1,0 +1,872 @@
+
+import mongoose from "mongoose";
+import User from "../models/User.js";
+import Department from "../models/Department.js";
+import Conversation from "../models/Conversation.js";
+import Message from "../models/Message.js";
+
+/* =====================================================
+   HELPERS
+===================================================== */
+
+const getCurrentUserId = (req) =>
+  req.user?._id || req.user?.userId || req.user?.id || null;
+
+const sameId = (a, b) =>
+  Boolean(a && b) && String(a) === String(b);
+
+const isAdmin = (user) =>
+  ["Admin", "SuperAdmin"].includes(user?.role);
+
+const getOrganizationId = (user) => {
+  if (!user) return null;
+  if (user.admin_id) return user.admin_id;
+  if (isAdmin(user)) return user._id;
+  return user.createdBy || null;
+};
+
+const getRequestOrganizationId = (req, user) =>
+  req.adminId || getOrganizationId(user);
+
+const getAuthenticatedUser = async (req) => {
+  const id = getCurrentUserId(req);
+  if (!id || !mongoose.isValidObjectId(id)) return null;
+  return User.findById(id);
+};
+
+const escapeRegex = (value) =>
+  String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const getSocketIO = (req) => req.app.get("io");
+
+const emitToUser = (io, userId, event, payload) => {
+  if (io && userId) {
+    io.to(`user:${String(userId)}`).emit(event, payload);
+  }
+};
+
+const departmentOrganizationFilter = (organizationId) => ({
+  $or: [
+    { admin_id: organizationId },
+    { createdBy: organizationId },
+  ],
+});
+
+/* =====================================================
+   DEPARTMENT ACCESS
+===================================================== */
+
+async function getUserDepartmentIds(user, organizationId) {
+  if (!user) return [];
+
+  let filter = { status: "Active" };
+
+  if (user.role !== "SuperAdmin") {
+    if (!organizationId) return [];
+
+    filter = {
+      status: "Active",
+      ...departmentOrganizationFilter(organizationId),
+    };
+  }
+
+  const departments = await Department.find(filter).select("_id");
+  return departments.map((department) => department._id);
+}
+
+async function canAccessDepartment(user, department, organizationId) {
+  if (!user || !department || department.status !== "Active") {
+    return false;
+  }
+
+  if (user.role === "SuperAdmin") return true;
+  if (!organizationId) return false;
+
+  return (
+    sameId(department.admin_id, organizationId) ||
+    sameId(department.createdBy, organizationId)
+  );
+}
+
+async function getConversationAccessFilter(user, organizationId) {
+  const conditions = [];
+
+  if (organizationId) {
+    conditions.push({
+      type: "private",
+      admin_id: organizationId,
+      participants: user._id,
+    });
+  }
+
+  const departmentIds = await getUserDepartmentIds(
+    user,
+    organizationId
+  );
+
+  if (departmentIds.length) {
+    conditions.push({
+      type: "department",
+      department: { $in: departmentIds },
+    });
+  }
+
+  // Groups: only their members
+  conditions.push({ type: "group", participants: user._id });
+
+  // SuperAdmin can see all conversations, but only department
+  // conversations associated with existing active departments.
+  if (user.role === "SuperAdmin") {
+    conditions.push({ type: "private" });
+  }
+
+  return conditions.length ? { $or: conditions } : { _id: null };
+}
+
+async function getUnreadCounts(conversationIds, userId) {
+  if (!conversationIds.length) return {};
+
+  const userObjectId = new mongoose.Types.ObjectId(String(userId));
+
+  const counts = await Message.aggregate([
+    {
+      $match: {
+        conversation: {
+          $in: conversationIds.map(
+            (id) => new mongoose.Types.ObjectId(String(id))
+          ),
+        },
+        sender: { $ne: userObjectId },
+        readBy: { $ne: userObjectId },
+      },
+    },
+    {
+      $group: {
+        _id: "$conversation",
+        count: { $sum: 1 },
+      },
+    },
+  ]);
+
+  return counts.reduce((result, item) => {
+    result[String(item._id)] = item.count;
+    return result;
+  }, {});
+}
+
+async function getConversationRecipientIds(conversation, senderId) {
+  if (conversation.type === "private" || conversation.type === "group") {
+    const users = await User.find({
+      _id: { $in: conversation.participants || [] },
+      status: "Active",
+    }).select("_id");
+
+    return users
+      .filter((user) => !sameId(user._id, senderId))
+      .map((user) => String(user._id));
+  }
+
+  if (conversation.type !== "department" || !conversation.department) {
+    return [];
+  }
+
+  const department = await Department.findOne({
+    _id: conversation.department,
+    status: "Active",
+  }).select("_id name admin_id createdBy");
+
+  if (!department) return [];
+
+  const organizationConditions = [];
+
+  if (department.admin_id) {
+    organizationConditions.push({ admin_id: department.admin_id });
+  }
+
+  if (department.createdBy) {
+    organizationConditions.push({ createdBy: department.createdBy });
+  }
+
+  if (!organizationConditions.length) return [];
+
+  const users = await User.find({
+    status: "Active",
+    department: {
+      $regex: `^${escapeRegex(department.name)}$`,
+      $options: "i",
+    },
+    $or: organizationConditions,
+    _id: { $ne: senderId },
+  }).select("_id");
+
+  return users.map((user) => String(user._id));
+}
+
+/* =====================================================
+   GET /api/chat/users
+===================================================== */
+
+export const getChatUsers = async (req, res) => {
+  try {
+    const currentUser = await getAuthenticatedUser(req);
+
+    if (!currentUser) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required.",
+      });
+    }
+
+    if (currentUser.status !== "Active") {
+      return res.status(403).json({
+        success: false,
+        message: "Your account is inactive.",
+      });
+    }
+
+    const organizationId = getRequestOrganizationId(req, currentUser);
+
+    if (!organizationId && currentUser.role !== "SuperAdmin") {
+      return res.status(403).json({
+        success: false,
+        message: "Organization could not be identified.",
+      });
+    }
+
+    const userFilter = {
+      status: "Active",
+      _id: { $ne: currentUser._id },
+    };
+
+    if (currentUser.role !== "SuperAdmin") {
+      userFilter.$or = [
+        { admin_id: organizationId },
+        { createdBy: organizationId },
+      ];
+    }
+
+    const users = await User.find(userFilter)
+      .select("_id name email phone department role status")
+      .sort({ name: 1 })
+      .lean();
+
+    return res.status(200).json({
+      success: true,
+      count: users.length,
+      users,
+    });
+  } catch (error) {
+    console.error("getChatUsers:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to load chat users.",
+    });
+  }
+};
+
+/* =====================================================
+   GET /api/chat/departments
+===================================================== */
+
+export const getChatDepartments = async (req, res) => {
+  try {
+    const currentUser = await getAuthenticatedUser(req);
+
+    if (!currentUser) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required.",
+      });
+    }
+
+    if (currentUser.status !== "Active") {
+      return res.status(403).json({
+        success: false,
+        message: "Your account is inactive.",
+      });
+    }
+
+    const organizationId = getRequestOrganizationId(req, currentUser);
+    let filter = { status: "Active" };
+
+    if (currentUser.role !== "SuperAdmin") {
+      if (!organizationId) {
+        return res.status(403).json({
+          success: false,
+          message: "Organization could not be identified.",
+        });
+      }
+
+      filter = {
+        status: "Active",
+        ...departmentOrganizationFilter(organizationId),
+      };
+    }
+
+    const departments = await Department.find(filter)
+      .select("_id name departmentName description status admin_id createdBy")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    return res.status(200).json({
+      success: true,
+      message: "Departments fetched successfully.",
+      count: departments.length,
+      data: departments,
+    });
+  } catch (error) {
+    console.error("getChatDepartments:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to load departments.",
+    });
+  }
+};
+
+/* =====================================================
+   POST /api/chat/private
+===================================================== */
+
+export const createPrivateConversation = async (req, res) => {
+  try {
+    const currentUser = await getAuthenticatedUser(req);
+    const { userId } = req.body || {};
+
+    if (!currentUser) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required.",
+      });
+    }
+
+    if (currentUser.status !== "Active") {
+      return res.status(403).json({
+        success: false,
+        message: "Your account is inactive.",
+      });
+    }
+
+    if (!mongoose.isValidObjectId(userId)) {
+      return res.status(400).json({
+        success: false,
+        message: "A valid userId is required.",
+      });
+    }
+
+    if (sameId(userId, currentUser._id)) {
+      return res.status(400).json({
+        success: false,
+        message: "You cannot chat with yourself.",
+      });
+    }
+
+    const organizationId = getRequestOrganizationId(req, currentUser);
+
+    if (!organizationId) {
+      return res.status(403).json({
+        success: false,
+        message: "Organization could not be identified.",
+      });
+    }
+
+    const recipient = await User.findOne({
+      _id: userId,
+      status: "Active",
+      $or: [
+        { admin_id: organizationId },
+        { createdBy: organizationId },
+      ],
+    });
+
+    if (!recipient) {
+      return res.status(404).json({
+        success: false,
+        message: "Chat user not found in your organization.",
+      });
+    }
+
+    const participants = [currentUser._id, recipient._id].sort(
+      (a, b) => String(a).localeCompare(String(b))
+    );
+
+    let conversation = await Conversation.findOne({
+      type: "private",
+      admin_id: organizationId,
+      participants: { $all: participants, $size: 2 },
+    });
+
+    if (!conversation) {
+      conversation = await Conversation.create({
+        type: "private",
+        admin_id: organizationId,
+        participants,
+        createdBy: currentUser._id,
+      });
+    }
+
+    conversation = await Conversation.findById(conversation._id)
+      .populate("participants", "name email department role status");
+
+    return res.status(200).json({ success: true, conversation });
+  } catch (error) {
+    console.error("createPrivateConversation:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to create private conversation.",
+    });
+  }
+};
+
+/* =====================================================
+   POST /api/chat/department
+===================================================== */
+
+export const createDepartmentConversation = async (req, res) => {
+  try {
+    const currentUser = await getAuthenticatedUser(req);
+    const departmentId =
+      req.body?.departmentId ||
+      req.body?.department_id ||
+      req.body?.department;
+
+    if (!currentUser) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required.",
+      });
+    }
+
+    if (currentUser.status !== "Active") {
+      return res.status(403).json({
+        success: false,
+        message: "Your account is inactive.",
+      });
+    }
+
+    if (!mongoose.isValidObjectId(departmentId)) {
+      return res.status(400).json({
+        success: false,
+        message: "A valid departmentId is required.",
+      });
+    }
+
+    const organizationId = getRequestOrganizationId(req, currentUser);
+    const department = await Department.findById(departmentId);
+
+    if (
+      !department ||
+      !(await canAccessDepartment(currentUser, department, organizationId))
+    ) {
+      return res.status(404).json({
+        success: false,
+        message: "Department not found or access denied.",
+      });
+    }
+
+    const conversationOrganizationId =
+      department.admin_id ||
+      department.createdBy ||
+      organizationId ||
+      currentUser._id;
+
+    let conversation = await Conversation.findOne({
+      type: "department",
+      admin_id: conversationOrganizationId,
+      department: department._id,
+    });
+
+    if (!conversation) {
+      try {
+        conversation = await Conversation.create({
+          type: "department",
+          admin_id: conversationOrganizationId,
+          department: department._id,
+          participants: [],
+          createdBy: currentUser._id,
+        });
+      } catch (error) {
+        if (error.code !== 11000) throw error;
+
+        conversation = await Conversation.findOne({
+          type: "department",
+          admin_id: conversationOrganizationId,
+          department: department._id,
+        });
+
+        if (!conversation) throw error;
+      }
+    }
+
+    conversation = await Conversation.findById(conversation._id)
+      .populate("department", "name description")
+      .populate("participants", "name email department role status")
+      .populate({
+        path: "lastMessage",
+        select: "text attachments sender createdAt",
+        populate: { path: "sender", select: "name" },
+      });
+
+    return res.status(200).json({ success: true, conversation });
+  } catch (error) {
+    console.error("createDepartmentConversation:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to open department conversation.",
+    });
+  }
+};
+
+/* =====================================================
+   GET /api/chat/conversations
+===================================================== */
+
+export const getConversations = async (req, res) => {
+  try {
+    const currentUser = await getAuthenticatedUser(req);
+
+    if (!currentUser) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required.",
+      });
+    }
+
+    if (currentUser.status !== "Active") {
+      return res.status(403).json({
+        success: false,
+        message: "Your account is inactive.",
+      });
+    }
+
+    const organizationId = getRequestOrganizationId(req, currentUser);
+
+    if (!organizationId && currentUser.role !== "SuperAdmin") {
+      return res.status(403).json({
+        success: false,
+        message: "Organization could not be identified.",
+      });
+    }
+
+    const accessFilter = await getConversationAccessFilter(
+      currentUser,
+      organizationId
+    );
+
+    const conversations = await Conversation.find(accessFilter)
+      .populate("participants", "name email department role status")
+      .populate("department", "name description")
+      .populate({
+        path: "lastMessage",
+        select: "text attachments sender createdAt",
+        populate: { path: "sender", select: "name" },
+      })
+      .sort({ lastMessageAt: -1, updatedAt: -1 })
+      .lean();
+
+    const visibleConversations = conversations.filter((conversation) => {
+      if (conversation.type !== "private") return true;
+
+      const participants = conversation.participants || [];
+
+      if (
+        participants.length !== 2 ||
+        participants.some((participant) => !participant?._id)
+      ) {
+        return false;
+      }
+
+      const otherParticipant = participants.find(
+        (participant) => !sameId(participant._id, currentUser._id)
+      );
+
+      return Boolean(
+        otherParticipant && otherParticipant.status === "Active"
+      );
+    });
+
+    const unreadCounts = await getUnreadCounts(
+      visibleConversations.map((conversation) => conversation._id),
+      currentUser._id
+    );
+
+    const result = visibleConversations.map((conversation) => ({
+      ...conversation,
+      unreadCount: unreadCounts[String(conversation._id)] || 0,
+    }));
+
+    return res.status(200).json({
+      success: true,
+      count: result.length,
+      conversations: result,
+    });
+  } catch (error) {
+    console.error("getConversations:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to load conversations.",
+    });
+  }
+};
+
+/* =====================================================
+   GET /api/chat/:conversationId/messages
+===================================================== */
+
+export const getMessages = async (req, res) => {
+  try {
+    const currentUser = await getAuthenticatedUser(req);
+    const { conversationId } = req.params;
+
+    if (!currentUser) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required.",
+      });
+    }
+
+    if (!mongoose.isValidObjectId(conversationId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid conversation ID.",
+      });
+    }
+
+    const organizationId = getRequestOrganizationId(req, currentUser);
+    const accessFilter = await getConversationAccessFilter(
+      currentUser,
+      organizationId
+    );
+
+    const conversation = await Conversation.findOne({
+      _id: conversationId,
+      ...accessFilter,
+    });
+
+    if (!conversation) {
+      return res.status(403).json({
+        success: false,
+        message: "You do not have access to this conversation.",
+      });
+    }
+
+    if (conversation.type === "department") {
+      const department = await Department.findById(conversation.department);
+
+      if (
+        !(await canAccessDepartment(
+          currentUser,
+          department,
+          organizationId
+        ))
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: "You do not have access to this department chat.",
+        });
+      }
+    }
+
+    if (conversation.type === "private") {
+      const participantIds = (conversation.participants || []).map(String);
+      const count = await User.countDocuments({
+        _id: { $in: participantIds },
+      });
+
+      if (participantIds.length !== 2 || count !== 2) {
+        return res.status(404).json({
+          success: false,
+          message: "This conversation is no longer available.",
+        });
+      }
+    }
+
+    await Message.updateMany(
+      {
+        conversation: conversation._id,
+        sender: { $ne: currentUser._id },
+        readBy: { $ne: currentUser._id },
+      },
+      { $addToSet: { readBy: currentUser._id } }
+    );
+
+    const messages = await Message.find({
+      conversation: conversation._id,
+    })
+      .populate("sender", "name email")
+      .sort({ createdAt: 1 })
+      .limit(200);
+
+    emitToUser(getSocketIO(req), currentUser._id, "chat:unread:update", {
+      conversationId: String(conversation._id),
+      unreadCount: 0,
+    });
+
+    return res.status(200).json({
+      success: true,
+      count: messages.length,
+      messages,
+    });
+  } catch (error) {
+    console.error("getMessages:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to load messages.",
+    });
+  }
+};
+
+/* =====================================================
+   POST /api/chat/:conversationId/messages
+===================================================== */
+
+export const sendMessage = async (req, res) => {
+  try {
+    const currentUser = await getAuthenticatedUser(req);
+    const { conversationId } = req.params;
+    const text = String(req.body?.text || "").trim();
+    const files = req.files || [];
+
+    if (!currentUser) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required.",
+      });
+    }
+
+    if (currentUser.status !== "Active") {
+      return res.status(403).json({
+        success: false,
+        message: "Your account is inactive.",
+      });
+    }
+
+    if (!mongoose.isValidObjectId(conversationId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid conversation ID.",
+      });
+    }
+
+    if (!text && !files.length) {
+      return res.status(400).json({
+        success: false,
+        message: "Type a message or attach a file.",
+      });
+    }
+
+    if (text.length > 5000) {
+      return res.status(400).json({
+        success: false,
+        message: "Message cannot exceed 5000 characters.",
+      });
+    }
+
+    const organizationId = getRequestOrganizationId(req, currentUser);
+    const accessFilter = await getConversationAccessFilter(
+      currentUser,
+      organizationId
+    );
+
+    const conversation = await Conversation.findOne({
+      _id: conversationId,
+      ...accessFilter,
+    });
+
+    if (!conversation) {
+      return res.status(403).json({
+        success: false,
+        message: "You cannot send messages to this conversation.",
+      });
+    }
+
+    if (conversation.type === "department") {
+      const department = await Department.findById(conversation.department);
+
+      if (
+        !(await canAccessDepartment(
+          currentUser,
+          department,
+          organizationId
+        ))
+      ) {
+        return res.status(403).json({
+          success: false,
+          message: "You cannot send messages to this department.",
+        });
+      }
+    }
+
+    if (conversation.type === "private") {
+      const participantIds = (conversation.participants || []).map(String);
+      const count = await User.countDocuments({
+        _id: { $in: participantIds },
+        status: "Active",
+      });
+
+      if (participantIds.length !== 2 || count !== 2) {
+        return res.status(404).json({
+          success: false,
+          message: "This conversation is no longer available.",
+        });
+      }
+    }
+
+    const message = await Message.create({
+      conversation: conversation._id,
+      sender: currentUser._id,
+      text,
+      attachments: files.map((f) => ({
+        filename: f.filename,
+        name: f.originalname,
+        size: f.size,
+        mimetype: f.mimetype,
+      })),
+      readBy: [currentUser._id],
+    });
+
+    conversation.lastMessage = message._id;
+    conversation.lastMessageAt = message.createdAt || new Date();
+    await conversation.save();
+
+    const populatedMessage = await Message.findById(message._id)
+      .populate("sender", "name email");
+
+    const io = getSocketIO(req);
+
+    if (io) {
+      const recipientIds = await getConversationRecipientIds(
+        conversation,
+        currentUser._id
+      );
+
+      for (const recipientId of recipientIds) {
+        const unreadCount = await Message.countDocuments({
+          conversation: conversation._id,
+          sender: { $ne: recipientId },
+          readBy: { $ne: recipientId },
+        });
+
+        emitToUser(io, recipientId, "chat:message:new", {
+          conversationId: String(conversation._id),
+          message: populatedMessage,
+        });
+
+        emitToUser(io, recipientId, "chat:unread:update", {
+          conversationId: String(conversation._id),
+          unreadCount,
+        });
+      }
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: populatedMessage,
+    });
+  } catch (error) {
+    console.error("sendMessage:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to send message.",
+    });
+  }
+};
