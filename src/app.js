@@ -39,7 +39,7 @@ export const server = http.createServer(app);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const allowedOrigins = [
-  "http://localhost:3000",
+  "https://task-backend-mn8a.onrender.com",
   "http://localhost:5173",
 ];
 
