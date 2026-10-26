@@ -53,6 +53,7 @@ const allowedOrigins = [
   "https://task-frontend-zeta-five.vercel.app",
   "http://localhost:5173",
   "http://localhost:3000",
+  "https://task-backend-mn8a.onrender.com",
 ];
 
 const corsOptions = {
