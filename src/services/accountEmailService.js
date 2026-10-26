@@ -7,19 +7,34 @@ const isTest = process.env.NODE_ENV === "test";
 // In tests nothing leaves the machine — messages are captured in sentMessages.
 export const sentMessages = [];
 
+// SMTP_USER / SMTP_PASS = Brevo login + SMTP key (authentication ONLY)
 const smtpUser = () => process.env.SMTP_USER?.trim();
 const smtpPass = () => process.env.SMTP_PASS?.trim().replace(/\s+/g, "");
+
+// FIX: the "From" address must be a sender verified in Brevo (MAIL_FROM),
+// never the SMTP login (xxxx@smtp-brevo.com) — Brevo rejects that.
+const mailFrom = () => process.env.MAIL_FROM?.trim();
 
 let transporter = null;
 const getTransporter = () => {
   if (isTest) return nodemailer.createTransport({ jsonTransport: true });
   if (!transporter) {
-    const port = Number(process.env.SMTP_PORT || 587);
+    // Render free blocks 25/465/587 — use 2525 with Brevo
+    const port = Number(process.env.SMTP_PORT || 2525);
     transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST || "smtp.gmail.com",
+      host: process.env.SMTP_HOST || "smtp-relay.brevo.com",
       port,
-      secure: port === 465,
+      secure: port === 465, // false for 2525/587 (STARTTLS)
       auth: { user: smtpUser(), pass: smtpPass() },
+      connectionTimeout: 15000,
+      greetingTimeout: 10000,
+      socketTimeout: 20000,
+    });
+
+    // One-time startup check — shows in Render logs
+    transporter.verify((err) => {
+      if (err) console.error("[accountEmail] SMTP connection failed:", err.code, err.message);
+      else console.log(`[accountEmail] SMTP ready (${process.env.SMTP_HOST}:${port}), from ${mailFrom()}`);
     });
   }
   return transporter;
@@ -50,18 +65,25 @@ export const send = async ({ to, subject, text, html }) => {
     console.warn(`[accountEmail] SMTP not configured — "${subject}" to ${to} not sent`);
     return { sent: false, reason: "Email server (SMTP) is not configured" };
   }
+
+  if (!isTest && !mailFrom()) {
+    console.warn(`[accountEmail] MAIL_FROM not set — "${subject}" to ${to} not sent`);
+    return { sent: false, reason: "Sender address (MAIL_FROM) is not configured" };
+  }
+
   try {
-    await getTransporter().sendMail({
-      from: `"Task Sphere" <${smtpUser() || "no-reply@tasksphere.local"}>`,
+    const info = await getTransporter().sendMail({
+      from: `"Task Sphere" <${mailFrom() || "no-reply@tasksphere.local"}>`,
       to,
       subject,
       text,
       html,
     });
     if (isTest) sentMessages.push({ to, subject, text });
+    else console.log(`[accountEmail] "${subject}" to ${to} accepted:`, info.messageId, info.response);
     return { sent: true };
   } catch (err) {
-    console.error(`[accountEmail] "${subject}" to ${to} failed:`, err.message);
+    console.error(`[accountEmail] "${subject}" to ${to} failed:`, err.code, err.responseCode, err.message);
     return { sent: false, reason: "The email could not be delivered" };
   }
 };
