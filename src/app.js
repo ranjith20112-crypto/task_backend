@@ -20,20 +20,23 @@ import supportRoutes from "./routes/supportRoutes.js";
 import permissionRoutes from "./routes/permissionRoutes.js";
 import notificationRoutes from "./routes/notificationRoutes.js";
 import customRoleRoutes from "./routes/customRoleRoutes.js";
+
 import {
   getConnectUrl,
   oauthCallback,
 } from "./controllers/googleConnectController.js";
-import { authorize } from "./middleware/role.js";
 
+import { authorize } from "./middleware/role.js";
 import { authenticate } from "./middleware/auth.js";
 import { attachScope } from "./middleware/scopeMiddleware.js";
 import { attachOrgUsers } from "./middleware/orgScope.js";
+
 import {
   attachPermissions,
   permissionByMethod,
   requirePermission,
 } from "./middleware/permissionMiddleware.js";
+
 import { registerChatSocket } from "./socket/Chatsocket.js";
 import { setRealtimeIO } from "./socket/realtime.js";
 
@@ -45,6 +48,7 @@ export const server = http.createServer(app);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ==================== CORS CONFIGURATION ====================
+
 const allowedOrigins = [
   "https://task-frontend-zeta-five.vercel.app",
   "http://localhost:5173",
@@ -53,26 +57,55 @@ const allowedOrigins = [
 
 const corsOptions = {
   origin: (origin, callback) => {
-    // Allow requests without an Origin header, such as server-to-server calls.
+    // Allow requests without an Origin header.
     if (!origin || allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
 
-    console.warn("CORS blocked origin:", origin);
+    console.error("CORS blocked origin:", origin);
     return callback(new Error("Origin not allowed by CORS"));
   },
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+
+  methods: [
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "OPTIONS",
+  ],
+
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+  ],
+
   credentials: true,
+  optionsSuccessStatus: 204,
 };
 
+// Apply CORS before routes and authentication middleware.
 app.use(cors(corsOptions));
 
+// Explicitly handle browser preflight requests.
+app.options(/.*/, cors(corsOptions));
+
 // ==================== SOCKET.IO ====================
+
 const io = new Server(server, {
   cors: {
     origin: allowedOrigins,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
+    methods: [
+      "GET",
+      "POST",
+      "PUT",
+      "PATCH",
+      "DELETE",
+    ],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+    ],
     credentials: true,
   },
 });
@@ -82,6 +115,7 @@ app.set("io", io);
 setRealtimeIO(io);
 
 // ==================== GENERAL MIDDLEWARE ====================
+
 app.use(express.json({ limit: "3mb" }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -90,6 +124,7 @@ if (process.env.NODE_ENV !== "test") {
 }
 
 // ==================== PUBLIC ROUTES ====================
+
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -107,21 +142,43 @@ app.get("/", (req, res) => {
       reports: "/api/reports",
       support: "/api/support",
       permissions: "/api/permissions",
+      notifications: "/api/notifications",
+      customRoles: "/api/custom-roles",
     },
   });
 });
 
+// Login and other authentication routes remain public.
 app.use("/api/auth", authRoutes);
 
-// Google OAuth callback
+// Google OAuth callback.
 app.get("/oauth2callback", oauthCallback);
 
 // ==================== PROTECTED ROUTES ====================
-const protect = [authenticate, attachScope, attachPermissions];
 
-app.use("/api/permissions", ...protect, permissionRoutes);
-app.use("/api/notifications", ...protect, notificationRoutes);
-app.use("/api/custom-roles", ...protect, customRoleRoutes);
+const protect = [
+  authenticate,
+  attachScope,
+  attachPermissions,
+];
+
+app.use(
+  "/api/permissions",
+  ...protect,
+  permissionRoutes
+);
+
+app.use(
+  "/api/notifications",
+  ...protect,
+  notificationRoutes
+);
+
+app.use(
+  "/api/custom-roles",
+  ...protect,
+  customRoleRoutes
+);
 
 app.post(
   "/api/google/connect-url",
@@ -130,10 +187,29 @@ app.post(
   getConnectUrl
 );
 
-app.use("/api/departments", ...protect, departmentRoutes);
-app.use("/api/tasks", ...protect, taskRoutes);
-app.use("/api/taskbank", ...protect, taskBankRoutes);
-app.use("/api/taskcalendar", ...protect, taskCalendarRoutes);
+app.use(
+  "/api/departments",
+  ...protect,
+  departmentRoutes
+);
+
+app.use(
+  "/api/tasks",
+  ...protect,
+  taskRoutes
+);
+
+app.use(
+  "/api/taskbank",
+  ...protect,
+  taskBankRoutes
+);
+
+app.use(
+  "/api/taskcalendar",
+  ...protect,
+  taskCalendarRoutes
+);
 
 app.use(
   "/api/meetings",
@@ -157,12 +233,21 @@ app.use(
   supportRoutes
 );
 
-app.use("/api/reports", ...protect, reportRoutes);
+app.use(
+  "/api/reports",
+  ...protect,
+  reportRoutes
+);
 
-// General user routes last
-app.use("/api", ...protect, userRoutes);
+// General user routes last.
+app.use(
+  "/api",
+  ...protect,
+  userRoutes
+);
 
 // ==================== 404 HANDLER ====================
+
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -171,8 +256,9 @@ app.use((req, res) => {
 });
 
 // ==================== GLOBAL ERROR HANDLER ====================
+
 app.use((err, req, res, next) => {
-  console.error("Global Error:", err);
+  console.error("Global Error:", err.message);
 
   if (res.headersSent) {
     return next(err);
@@ -182,7 +268,11 @@ app.use((err, req, res, next) => {
 
   res.status(status).json({
     success: false,
-    message: status < 500 ? err.message : "Something went wrong",
+    message:
+      status < 500
+        ? err.message
+        : "Something went wrong",
+
     error:
       process.env.NODE_ENV === "production"
         ? undefined
