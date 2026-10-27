@@ -1,21 +1,32 @@
 import "dotenv/config";
 import nodemailer from "nodemailer";
 
-const port = Number(process.env.SMTP_PORT || 587);
+// Brevo SMTP — same settings as accountEmail.js (which already works).
+// Render free tier blocks 25/465/587, so the default port is 2525.
+const port = Number(process.env.SMTP_PORT || 2525);
 const timeZone = process.env.MEETING_TIME_ZONE || "Asia/Kolkata";
+
+// SMTP_USER / SMTP_PASS = Brevo login + SMTP key (authentication ONLY)
+// MAIL_FROM            = sender verified in Brevo (the visible "From" address)
+// FIX: "from" used to be SMTP_USER (xxxx@smtp-brevo.com) — Brevo rejects that
+// as "sender not valid", so no meeting email was ever delivered.
+const mailFrom = () => process.env.MAIL_FROM?.trim();
 
 // Tests: nothing leaves the machine — messages are captured instead
 const isTest = process.env.NODE_ENV === "test";
 export const capturedMeetingEmails = [];
 
 const transporter = isTest ? nodemailer.createTransport({ jsonTransport: true }) : nodemailer.createTransport({
-  host: process.env.SMTP_HOST || "smtp.gmail.com",
+  host: process.env.SMTP_HOST || "smtp-relay.brevo.com",
   port,
-  secure: port === 465,
+  secure: port === 465, // false for 2525/587 (STARTTLS)
   auth: {
     user: process.env.SMTP_USER?.trim(),
     pass: process.env.SMTP_PASS?.trim().replace(/\s+/g, ""),
   },
+  connectionTimeout: 15000,
+  greetingTimeout: 10000,
+  socketTimeout: 20000,
 });
 
 const BRAND = {
@@ -307,7 +318,16 @@ const sendToAttendees = async (meeting, subject, text, html) => {
       sent: false,
       sentCount: 0,
       failedCount: 0,
-      reason: "Gmail SMTP credentials are missing from .env",
+      reason: "Email (SMTP_USER / SMTP_PASS) is not configured on the server",
+    };
+  }
+
+  if (!isTest && !mailFrom()) {
+    return {
+      sent: false,
+      sentCount: 0,
+      failedCount: 0,
+      reason: "Sender address (MAIL_FROM) is not configured on the server",
     };
   }
 
@@ -325,7 +345,7 @@ const sendToAttendees = async (meeting, subject, text, html) => {
   const results = await Promise.allSettled(
     recipients.map(async (email) => {
       const info = await transporter.sendMail({
-        from: `"${BRAND.name}" <${smtpUser || "no-reply@tasksphere.local"}>`,
+        from: `"${BRAND.name}" <${mailFrom() || "no-reply@tasksphere.local"}>`,
         to: email,
         subject,
         text,
@@ -343,12 +363,14 @@ const sendToAttendees = async (meeting, subject, text, html) => {
 
   let sentCount = 0;
   let failedCount = 0;
+  let firstError = "";
 
   results.forEach((result, index) => {
     if (result.status === "fulfilled") {
       sentCount += 1;
     } else {
       failedCount += 1;
+      firstError = firstError || result.reason?.message || "";
       console.error("Attendee email delivery failed:", {
         recipient: recipients[index],
         code: result.reason?.code,
@@ -363,7 +385,7 @@ const sendToAttendees = async (meeting, subject, text, html) => {
     sentCount,
     failedCount,
     reason: failedCount
-      ? "One or more attendee emails failed; check backend logs"
+      ? `${failedCount} of ${recipients.length} email(s) failed${firstError ? `: ${firstError}` : ""}`
       : undefined,
   };
 };
