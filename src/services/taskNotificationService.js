@@ -217,6 +217,76 @@ export const notifyStatusChanged = safe(async (task, actor, from, to) => {
   });
 });
 
+// ==================== REVIEW RESULT → assignee ====================
+// decision "completed": the assigner approved the work → reward + new score
+// decision "rework":    the assigner sent it back from Review (with the reason)
+export const notifyReviewDecision = safe(async (task, actor, { decision, reward = 0, score = null, note = "", celebration = null }) => {
+  if (!task?.assignedTo || String(task.assignedTo) === String(actor._id)) return;
+
+  const assignee = await User.findById(task.assignedTo).select("name email status preferences points");
+  if (!assignee) return;
+
+  const completed = decision === "completed";
+  const total = score ?? assignee.points ?? 0;
+  const extras = completed && celebration
+    ? [
+        celebration.levelUp ? ` Level up: ${celebration.level.icon} ${celebration.level.name}!` : "",
+        ...(celebration.newBadges || []).map((b) => ` New badge: ${b.icon} ${b.name}.`),
+      ].join("")
+    : "";
+  const message = completed
+    ? `${actor.name} approved "${task.name}" with a score of ${reward}/10 — your task is completed. +${reward} points, your total score is now ${total}.${extras}`
+    : `${actor.name} sent "${task.name}" back for rework${note ? `: ${note}` : "."}`;
+
+  await notify({
+    recipient: assignee._id,
+    admin_id: task.admin_id,
+    type: completed ? "task_completed" : "task_rework",
+    task: task._id,
+    taskName: task.name,
+    actor: actor._id,
+    actorName: actor.name,
+    fromStatus: "Review",
+    toStatus: task.status,
+    message,
+    celebration: completed ? celebration : null,
+  });
+
+  if (!wantsEmail(assignee, "general")) return;
+  const deadline = deadlineOf(task);
+  await send({
+    to: assignee.email,
+    subject: completed ? `✅ "${task.name}" is completed — scored ${reward}/10` : `↺ Rework needed: "${task.name}"`,
+    text: `Hi ${assignee.name},\n\n${message}\n\n${detailsText(task, deadline)}`,
+    html: layout(completed ? "Your task is completed" : "Rework requested", `
+      <p>Hi <strong>${escapeHtml(assignee.name)}</strong>,</p>
+      ${
+        completed
+          ? `<p><strong>${escapeHtml(actor.name)}</strong> reviewed and approved <strong>${escapeHtml(task.name)}</strong>.</p>
+             <p style="font-size:15px">Score: <strong style="color:#0b8f87">${reward}/10</strong> · +${reward} points · Your total: <strong style="color:#0b8f87">${total}</strong></p>`
+          : `<p><strong>${escapeHtml(actor.name)}</strong> reviewed <strong>${escapeHtml(task.name)}</strong> and sent it back for rework.</p>
+             ${note ? `<p style="padding:10px 12px;border-left:3px solid #f59e0b;background:#fffbeb">${escapeHtml(note)}</p>` : ""}`
+      }
+      ${detailsHtml(task, deadline)}
+      ${button(taskLink(), "View task")}`),
+  });
+});
+
+// ==================== SUBTASK ASSIGNED → assignee (dashboard only) ====================
+export const notifySubtaskAssigned = safe(async (task, actor, title) => {
+  if (!task?.assignedTo || String(task.assignedTo) === String(actor._id)) return;
+  await notify({
+    recipient: task.assignedTo,
+    admin_id: task.admin_id,
+    type: "task_subtask",
+    task: task._id,
+    taskName: task.name,
+    actor: actor._id,
+    actorName: actor.name,
+    message: `${actor.name} assigned you a subtask in "${task.name}": ${title}`,
+  });
+});
+
 // ==================== REMINDER SWEEP (runs every minute) ====================
 const REMINDERS = {
   reminder3hAt: { label: "3 hours", n: 1 },
