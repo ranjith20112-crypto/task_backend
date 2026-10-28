@@ -51,6 +51,22 @@ const conversationSchema = new mongoose.Schema(
       default: null,
     },
 
+    // Disappearing messages: new messages are deleted this many seconds after sending (0 = off)
+    disappearAfter: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    disappearSetBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    disappearSetAt: {
+      type: Date,
+      default: null,
+    },
+
     lastMessageAt: {
       type: Date,
       default: Date.now,
