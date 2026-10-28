@@ -3,6 +3,7 @@ import dotenv from "dotenv";
 import { server } from "./app.js";
 import { startMeetingReminderJob } from "./jobs/meetingReminderJob.js";
 import { startTaskReminderJob } from "./jobs/taskReminderJob.js";
+import { startChatExpiryJob } from "./jobs/chatExpiryJob.js";
 import { resumeInterruptedTranscriptions } from "./services/transcriptionService.js";
 
 dotenv.config();
@@ -28,6 +29,7 @@ mongoose
 
       startMeetingReminderJob();
       startTaskReminderJob();
+      startChatExpiryJob();
       resumeInterruptedTranscriptions().catch((e) => console.error("Transcription resume failed:", e.message));
     });
   })
