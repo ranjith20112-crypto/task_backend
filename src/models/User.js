@@ -97,6 +97,14 @@ const userSchema = new mongoose.Schema(
       default: "",
       maxlength: [500, "Bio must be at most 500 characters"],
     },
+    // Voice profile the user recorded themselves (with consent) so meeting transcripts can
+    // show their name. Only a voice vector is kept — not the audio. Hidden from queries.
+    voiceProfile: {
+      embedding: { type: [Number], select: false, default: undefined },
+      seconds: { type: Number, default: 0 },
+      consentAt: { type: Date, default: null },
+      updatedAt: { type: Date, default: null },
+    },
     // Personal preferences shown on the Settings page.
     preferences: {
       microphone: { type: Boolean, default: true },
@@ -104,7 +112,7 @@ const userSchema = new mongoose.Schema(
       aiSummary: { type: Boolean, default: true },
       emailNotifications: { type: Boolean, default: true },
       taskReminders: { type: Boolean, default: true },
-      desktopNotifications: { type: Boolean, default: false },
+      desktopNotifications: { type: Boolean, default: true }, // browser push notifications
       aiProvider: { type: String, default: "Gemini" },
       language: { type: String, default: "English" },
       timezone: { type: String, default: "Asia/Kolkata" },
