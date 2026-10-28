@@ -8,6 +8,11 @@ const subtaskSchema = new mongoose.Schema(
   {
     title: { type: String, required: true, trim: true },
     completed: { type: Boolean, default: false },
+    // Who gave this subtask to the assignee (the main task's assigner, a manager…)
+    assignedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    assignedByName: { type: String, default: "" },
+    assignedAt: { type: Date, default: null },
+    completedAt: { type: Date, default: null },
   },
   { _id: true }
 );
@@ -97,6 +102,12 @@ const taskSchema = new mongoose.Schema(
     // 🔄 STATUS
     status: { type: String, enum: TASK_STATUSES, default: "To Do", index: true },
     statusHistory: { type: [statusHistorySchema], default: [] },
+    // Times the assigner sent the task back from Review for rework
+    reworkCount: { type: Number, default: 0 },
+    // Score 1–10 the assigner gave when approving the task — added to the assignee's points
+    reviewScore: { type: Number, min: 1, max: 10, default: null },
+    // Points given when it was completed — taken back exactly if reopened
+    pointsAwarded: { type: Number, default: 0 },
     completedAt: { type: Date, default: null },
   },
   { timestamps: true }
