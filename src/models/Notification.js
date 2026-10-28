@@ -4,6 +4,7 @@ import { emitToUser } from "../socket/realtime.js";
 // In-app notifications (dashboard panel). Emails are sent alongside when allowed.
 export const NOTIFICATION_TYPES = [
   "task_assigned", "task_reassigned", "task_reminder", "task_overdue", "task_status",
+  "task_completed", "task_rework", "task_subtask",
   "support_ticket", "support_reply",
 ];
 
@@ -19,6 +20,8 @@ const notificationSchema = new mongoose.Schema(
     fromStatus: { type: String, default: "" },
     toStatus: { type: String, default: "" },
     message: { type: String, default: "" },
+    // Task completed → points earned, new score, level-up, new badges (the "you win" screen)
+    celebration: { type: mongoose.Schema.Types.Mixed, default: null },
     read: { type: Boolean, default: false, index: true },
   },
   { timestamps: true }
