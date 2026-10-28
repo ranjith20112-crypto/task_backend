@@ -5,6 +5,7 @@ import Department from "../models/Department.js";
 import Conversation from "../models/Conversation.js";
 import Message, { notExpired } from "../models/Message.js";
 import { recordChatFiles } from "../services/chatBackupService.js";
+import { pushChatMessage } from "../services/pushService.js";
 
 /* =====================================================
    HELPERS
@@ -892,6 +893,19 @@ export const sendMessage = async (req, res) => {
         });
       }
     }
+
+    // push to their browsers too (works when the app is closed)
+    getConversationRecipientIds(conversation, currentUser._id)
+      .then((recipientIds) =>
+        pushChatMessage(recipientIds, {
+          conversationId: String(conversation._id),
+          senderName: currentUser.name || "Someone",
+          text: message.text || "",
+          attachments: message.attachments?.length || 0,
+          chatName: conversation.type === "private" ? "" : conversation.name || "",
+        })
+      )
+      .catch((err) => console.error("[push] chat:", err.message));
 
     return res.status(201).json({
       success: true,
