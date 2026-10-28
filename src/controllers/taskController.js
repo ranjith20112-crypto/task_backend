@@ -10,10 +10,14 @@ import Department from "../models/Department.js";
 import { MEMBER_ROLES } from "../config/permissions.js";
 import { hasPermission } from "../middleware/permissionMiddleware.js";
 import { readCSV, isValidISODate } from "../utils/csv.js";
+import { emitToUser } from "../socket/realtime.js";
+import { parseReviewScore, scoreProfile, celebrationFor, levelFor, LEVELS } from "../services/scoreService.js";
 import {
   notifyTaskAssigned,
   notifyTaskReassigned,
   notifyStatusChanged,
+  notifyReviewDecision,
+  notifySubtaskAssigned,
 } from "../services/taskNotificationService.js";
 
 // Fire-and-forget: emails must never delay or fail the API response
@@ -344,6 +348,8 @@ const shapeTask = (task) => {
     isTaskBank: t.isTaskBank || false,
     status: t.status,
     statusHistory: t.statusHistory,
+    reworkCount: t.reworkCount || 0,
+    reviewScore: t.reviewScore ?? null,
     completedAt: t.completedAt,
     createdAt: t.createdAt,
     updatedAt: t.updatedAt,
@@ -491,7 +497,14 @@ export const createTask = async (req, res) => {
       recurrenceInterval,
       attachments,
       subtasks: Array.isArray(subtasks)
-        ? subtasks.map((s) => ({ title: s.title || s })).filter((s) => s.title)
+        ? subtasks
+            .map((s) => ({
+              title: s.title || s,
+              assignedBy: req.user._id,
+              assignedByName: actor.name,
+              assignedAt: new Date(),
+            }))
+            .filter((s) => s.title)
         : [],
       status: initialStatus,
     };
@@ -931,8 +944,24 @@ export const updateTask = async (req, res) => {
       task.set("notifications.overdueAlertAt", null);
     }
     if (Array.isArray(body.subtasks)) {
+      // keep who assigned each existing subtask; new ones are assigned by the editor
+      const editor = await getActor(req);
+      const existing = new Map(task.subtasks.map((s) => [String(s._id), s]));
+      const byTitle = new Map(task.subtasks.map((s) => [s.title, s]));
       task.subtasks = body.subtasks
-        .map((s) => ({ title: s.title || s, completed: Boolean(s.completed) }))
+        .map((s) => {
+          const title = String(s.title || s || "").trim();
+          const old = (s._id && existing.get(String(s._id))) || byTitle.get(title);
+          return {
+            ...(old ? { _id: old._id } : {}),
+            title,
+            completed: Boolean(s.completed ?? old?.completed),
+            completedAt: old?.completedAt || null,
+            assignedBy: old ? old.assignedBy : req.user._id,
+            assignedByName: old ? old.assignedByName : editor.name,
+            assignedAt: old ? old.assignedAt : new Date(),
+          };
+        })
         .filter((s) => s.title);
     }
 
@@ -1046,9 +1075,22 @@ export const updateTask = async (req, res) => {
 };
 
 /* ==================== PATCH /api/tasks/:id/status  ==================== */
+// Review flow:
+//   • the assignee moves the task To Do → In Progress → Review
+//   • only the person who ASSIGNED the task can mark it Completed (from Review),
+//     giving a score 1–10 that is added to the assignee's points (they are told their new score)
+//   • or the assigner sends it back from Review for rework (In Progress / To Do, with a reason)
+//   • only the assigner can reopen a Completed task (the reward is taken back)
+// Tasks without an assigner (old / imported) fall back to Admin / Manager.
+export const isTaskAssigner = (req, task) => {
+  if (task.assignedBy) return String(task.assignedBy) === String(req.user._id);
+  return isOrgAdmin(req) || req.user.role === "Manager";
+};
+
 export const updateTaskStatus = async (req, res) => {
   try {
-    const { status, note } = req.body;
+    const { status } = req.body;
+    const note = String(req.body.note || "").trim().slice(0, 1000);
 
     if (!status || !TASK_STATUSES.includes(status)) {
       return res.status(400).json({
@@ -1075,6 +1117,44 @@ export const updateTaskStatus = async (req, res) => {
       return res.json({ success: true, message: "Status unchanged", data: shapeTask(task) });
     }
 
+    const isAssigner = isTaskAssigner(req, task);
+    const selfAssigned = task.assignedBy && task.assignedTo && String(task.assignedBy) === String(task.assignedTo);
+
+    if (status === "Completed") {
+      if (!isAssigner) {
+        return res.status(403).json({
+          success: false,
+          code: "ASSIGNER_ONLY",
+          message: "Only the person who assigned this task can mark it Completed. Move it to Review and they will check it.",
+        });
+      }
+      if (from !== "Review" && !selfAssigned) {
+        return res.status(409).json({
+          success: false,
+          code: "REVIEW_FIRST",
+          message: "The task must be in Review before it can be marked Completed.",
+        });
+      }
+      if (!selfAssigned && parseReviewScore(req.body.score) === null) {
+        return res.status(400).json({
+          success: false,
+          code: "SCORE_REQUIRED",
+          message: "Give the task a score from 1 to 10 to approve it.",
+        });
+      }
+    }
+
+    if (from === "Completed" && !isAssigner) {
+      return res.status(403).json({
+        success: false,
+        code: "ASSIGNER_ONLY",
+        message: "Only the person who assigned this task can reopen it.",
+      });
+    }
+
+    // The assigner sending the work back from Review = rework
+    const isRework = from === "Review" && ["To Do", "In Progress"].includes(status) && isAssigner && !selfAssigned;
+
     const actor = await getActor(req);
 
     task.status = status;
@@ -1083,22 +1163,59 @@ export const updateTaskStatus = async (req, res) => {
       to: status,
       changedBy: req.user.id,
       changedByName: actor.name,
-      note: note || "",
+      note: isRework ? `Rework requested${note ? `: ${note}` : ""}` : note,
     });
+
+    let score = null;
+    let celebration = null;
+    // Points = the score (1–10) the assigner gives; your own tasks earn no points
+    const reward = status === "Completed" && !selfAssigned ? parseReviewScore(req.body.score) : 0;
 
     if (status === "Completed") {
       task.completedAt = new Date();
-      if (task.assignedTo) {
-        await User.findByIdAndUpdate(task.assignedTo, { $inc: { points: task.reward || 0 } });
-      }
+      task.reviewScore = reward || null;
+      task.pointsAwarded = reward;
     } else {
       task.completedAt = null;
+      task.reviewScore = null;
     }
+    if (isRework) task.reworkCount = (task.reworkCount || 0) + 1;
 
+    const before = status === "Completed" && task.assignedTo ? await scoreProfile(task.assignedTo) : null;
     await task.save();
 
+    if (status === "Completed" && task.assignedTo && reward) {
+      const user = await User.findByIdAndUpdate(task.assignedTo, { $inc: { points: reward } }, { new: true }).select("points");
+      score = user?.points ?? null;
+      celebration = celebrationFor(before, await scoreProfile(task.assignedTo), reward);
+    } else if (from === "Completed" && task.assignedTo) {
+      // Reopened → the points given for completing it are taken back
+      const given = task.pointsAwarded || 0;
+      const user = await User.findByIdAndUpdate(task.assignedTo, { $inc: { points: -given } }, { new: true }).select("points");
+      if (user && user.points < 0) await User.updateOne({ _id: user._id }, { points: 0 });
+      task.pointsAwarded = 0;
+      await task.save();
+    }
+
+    // Pop the "you win" screen on the assignee's open tabs (also when they completed their own task)
+    if (celebration) {
+      emitToUser(task.assignedTo, "task:celebrate", {
+        ...celebration,
+        taskId: String(task._id),
+        taskName: task.name,
+        approvedBy: selfAssigned ? "" : actor.name,
+      });
+    }
+
+    const who = { _id: req.user._id, name: actor.name };
     // Tell the person who assigned the task who changed it (email + dashboard)
-    notifyStatusChanged(task, { _id: req.user._id, name: actor.name }, from, status);
+    notifyStatusChanged(task, who, from, status);
+    // Tell the assignee the result of the review
+    if (status === "Completed" && !selfAssigned) {
+      notifyReviewDecision(task, who, { decision: "completed", reward, score, note, celebration });
+    } else if (isRework) {
+      notifyReviewDecision(task, who, { decision: "rework", note });
+    }
 
     const populated = await Task.findById(task._id)
       .populate("assignedTo", "name email department")
@@ -1106,9 +1223,170 @@ export const updateTaskStatus = async (req, res) => {
 
     res.json({
       success: true,
-      message: `Status updated: "${from}" → "${status}"`,
+      message:
+        status === "Completed"
+          ? reward
+            ? `Task completed with ${reward}/10. ${populated.assignedTo?.name || "The assignee"} earned ${reward} points${score !== null ? ` (total score: ${score})` : ""}.`
+            : "Task completed."
+          : isRework
+          ? `Sent back for rework. ${populated.assignedTo?.name || "The assignee"} has been notified.`
+          : `Status updated: "${from}" → "${status}"`,
+      score,
+      celebration,
+      // the "you win" screen is shown to the person who did the task
+      celebrateFor: celebration ? String(task.assignedTo) : null,
+      rework: isRework,
       data: shapeTask(populated),
     });
+  } catch (error) {
+    sendError(res, error);
+  }
+};
+
+/* ==================== SUBTASKS (assign / tick / move / remove) ==================== */
+//   POST   /api/tasks/:id/subtasks          { title }            → assigner / manager gives a subtask to this person
+//   PATCH  /api/tasks/:id/subtasks/:subId   { completed }        → the assignee (or a manager) ticks it
+//   PATCH  /api/tasks/:id/subtasks/:subId   { moveTo: taskId }   → manager moves it to another person of the same shared task
+//   DELETE /api/tasks/:id/subtasks/:subId                        → manager removes it
+const findScopedTask = async (req, res, id = req.params.id) => {
+  if (!mongoose.isValidObjectId(id)) {
+    res.status(400).json({ success: false, message: "Invalid task ID" });
+    return null;
+  }
+  const task = await Task.findOne({ _id: id, ...req.scope });
+  if (!task) res.status(404).json({ success: false, message: "Task not found" });
+  return task;
+};
+
+const subtaskResponse = async (res, taskIds, message, status = 200) => {
+  const tasks = await Task.find({ _id: { $in: taskIds } })
+    .populate("assignedTo", "name email department")
+    .populate("assignedBy", "name email");
+  res.status(status).json({ success: true, message, data: tasks.map(shapeTask) });
+};
+
+export const addSubtask = async (req, res) => {
+  try {
+    const task = await findScopedTask(req, res);
+    if (!task) return;
+    if (!canModifyTask(req, task)) {
+      return res.status(403).json({ success: false, message: "Only the person who assigned this task, a Manager or an Admin can assign subtasks" });
+    }
+    const title = String(req.body.title || "").trim().slice(0, 300);
+    if (!title) return res.status(400).json({ success: false, message: "Subtask title is required" });
+
+    const actor = await getActor(req);
+    task.subtasks.push({
+      title,
+      assignedBy: req.user._id,
+      assignedByName: actor.name,
+      assignedAt: new Date(),
+    });
+    await task.save();
+    notifySubtaskAssigned(task, { _id: req.user._id, name: actor.name }, title);
+    await subtaskResponse(res, [task._id], `Subtask assigned to ${(await User.findById(task.assignedTo).select("name"))?.name || "the assignee"}`, 201);
+  } catch (error) {
+    sendError(res, error);
+  }
+};
+
+export const updateSubtask = async (req, res) => {
+  try {
+    const task = await findScopedTask(req, res);
+    if (!task) return;
+    const sub = task.subtasks.id(req.params.subId);
+    if (!sub) return res.status(404).json({ success: false, message: "Subtask not found" });
+
+    const isManager = canModifyTask(req, task);
+    const isAssignee = task.assignedTo && String(task.assignedTo) === String(req.user._id);
+
+    // Move to another person of the same shared task
+    if (req.body.moveTo !== undefined) {
+      if (!isManager) {
+        return res.status(403).json({ success: false, message: "Only the person who assigned this task, a Manager or an Admin can move subtasks" });
+      }
+      const target = await findScopedTask(req, res, req.body.moveTo);
+      if (!target) return;
+      if (!task.taskGroupId || String(target.taskGroupId) !== String(task.taskGroupId) || String(target._id) === String(task._id)) {
+        return res.status(400).json({ success: false, message: "A subtask can only move to another person of the same shared task" });
+      }
+      const actor = await getActor(req);
+      target.subtasks.push({
+        title: sub.title,
+        completed: false,
+        assignedBy: req.user._id,
+        assignedByName: actor.name,
+        assignedAt: new Date(),
+      });
+      sub.deleteOne();
+      await Promise.all([task.save(), target.save()]);
+      notifySubtaskAssigned(target, { _id: req.user._id, name: actor.name }, target.subtasks[target.subtasks.length - 1].title);
+      const to = await User.findById(target.assignedTo).select("name");
+      return subtaskResponse(res, [task._id, target._id], `Subtask moved to ${to?.name || "the other person"}`);
+    }
+
+    if (req.body.completed !== undefined) {
+      if (!isManager && !isAssignee) {
+        return res.status(403).json({ success: false, message: "Only the assignee, the task creator, a Manager or an Admin can tick subtasks" });
+      }
+      sub.completed = Boolean(req.body.completed);
+      sub.completedAt = sub.completed ? new Date() : null;
+    }
+    if (req.body.title !== undefined) {
+      if (!isManager) return res.status(403).json({ success: false, message: "Only the task creator, a Manager or an Admin can rename subtasks" });
+      const title = String(req.body.title || "").trim().slice(0, 300);
+      if (!title) return res.status(400).json({ success: false, message: "Subtask title is required" });
+      sub.title = title;
+    }
+    await task.save();
+    await subtaskResponse(res, [task._id], "Subtask updated");
+  } catch (error) {
+    sendError(res, error);
+  }
+};
+
+export const deleteSubtask = async (req, res) => {
+  try {
+    const task = await findScopedTask(req, res);
+    if (!task) return;
+    if (!canModifyTask(req, task)) {
+      return res.status(403).json({ success: false, message: "Only the task creator, a Manager or an Admin can remove subtasks" });
+    }
+    const sub = task.subtasks.id(req.params.subId);
+    if (!sub) return res.status(404).json({ success: false, message: "Subtask not found" });
+    sub.deleteOne();
+    await task.save();
+    await subtaskResponse(res, [task._id], "Subtask removed");
+  } catch (error) {
+    sendError(res, error);
+  }
+};
+
+/* ==================== GET /api/tasks/scoreboard  ==================== */
+// My points, level and badges + the organization's leaderboard (top 10)
+export const getScoreboard = async (req, res) => {
+  try {
+    const me = await scoreProfile(req.user._id);
+
+    const filter = { status: "Active", role: { $ne: "SuperAdmin" } };
+    if (req.user.role !== "SuperAdmin") {
+      const orgId = req.user.role === "Admin" ? req.user._id : req.adminId;
+      filter.$or = [{ _id: orgId }, { admin_id: orgId }];
+    }
+    const top = await User.find(filter).select("name department points").sort({ points: -1, name: 1 }).limit(10).lean();
+    const leaderboard = top.map((u, i) => {
+      const level = levelFor(u.points || 0);
+      return {
+        rank: i + 1,
+        userId: String(u._id),
+        name: u.name,
+        department: u.department || "",
+        points: u.points || 0,
+        level: { name: level.name, icon: level.icon },
+      };
+    });
+
+    res.json({ success: true, data: { me, leaderboard, levels: LEVELS } });
   } catch (error) {
     sendError(res, error);
   }
