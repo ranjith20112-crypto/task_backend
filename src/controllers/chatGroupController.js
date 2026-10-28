@@ -14,7 +14,7 @@ export const CHAT_UPLOAD_DIR = path.resolve(path.dirname(fileURLToPath(import.me
 fs.mkdirSync(CHAT_UPLOAD_DIR, { recursive: true });
 
 export const CHAT_ALLOWED_EXT = ["jpg", "jpeg", "png", "gif", "webp", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "zip", "mp3", "mp4"];
-export const CHAT_MAX_FILE = 10 * 1024 * 1024;
+export const CHAT_MAX_FILE = 5 * 1024 * 1024; // 5 MB per file; message text is not limited
 const MAX_FILES = 5;
 const MAX_GROUP_MEMBERS = 200;
 
@@ -178,7 +178,7 @@ const chatMulter = multer({
     filename: (req, file, cb) =>
       cb(null, `chat-${Date.now()}-${crypto.randomUUID()}${path.extname(file.originalname).toLowerCase()}`),
   }),
-  limits: { fileSize: CHAT_MAX_FILE, files: MAX_FILES },
+  limits: { fileSize: CHAT_MAX_FILE, files: MAX_FILES, fieldSize: 3 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const ext = path.extname(file.originalname).slice(1).toLowerCase();
     if (CHAT_ALLOWED_EXT.includes(ext)) return cb(null, true);
@@ -197,7 +197,7 @@ export const chatUpload = (req, res, next) => {
   chatMulter(req, res, async (err) => {
     if (err) {
       const message =
-        err.code === "LIMIT_FILE_SIZE" ? "Each file must be 10 MB or smaller"
+        err.code === "LIMIT_FILE_SIZE" ? "Each file must be 5 MB or smaller"
         : err.code === "LIMIT_FILE_COUNT" ? `Attach at most ${MAX_FILES} files per message`
         : err.message;
       return res.status(400).json({ success: false, message });
