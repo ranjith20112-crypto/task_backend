@@ -7,6 +7,7 @@ import {
   getConversations,
   getMessages,
   sendMessage,
+  setDisappearingMessages,
 } from "../controllers/chatController.js";
 import {
   createGroup,
@@ -15,6 +16,7 @@ import {
   chatUpload,
   downloadChatAttachment,
 } from "../controllers/chatGroupController.js";
+import { listChatBackup, downloadChatBackup, deleteChatBackup } from "../controllers/chatBackupController.js";
 import { requirePermission, hasPermission } from "../middleware/permissionMiddleware.js";
 
 const router = express.Router();
@@ -32,10 +34,16 @@ router.post("/groups", requirePermission("chat", "create_group"), createGroup);
 router.patch("/groups/:id", requirePermission("chat", "manage_members"), updateGroup);
 router.post("/groups/:id/leave", leaveGroup);
 
+// Chat file backup (Settings → Chat file backup)
+router.get("/backup", listChatBackup);
+router.get("/backup/:id/download", requirePermission("chat", "download"), downloadChatBackup);
+router.delete("/backup/:id", deleteChatBackup);
+
 // Attachments (download / view)
 router.get("/attachments/:filename", requirePermission("chat", "download"), downloadChatAttachment);
 
 router.get("/:conversationId/messages", getMessages);
+router.put("/:conversationId/disappearing", requirePermission("chat", "send"), setDisappearingMessages);
 router.post(
   "/:conversationId/messages",
   requirePermission("chat", "send"),
