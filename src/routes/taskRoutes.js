@@ -18,6 +18,10 @@ import {
   downloadTaskAttachment,
   uploadImportCSV,
   importTasks,
+  getScoreboard,
+  addSubtask,
+  updateSubtask,
+  deleteSubtask,
 } from "../controllers/taskController.js";
 import { requirePermission, requireAnyPermission } from "../middleware/permissionMiddleware.js";
 
@@ -34,6 +38,7 @@ router.delete("/bank/:id", requirePermission("taskbank", "delete"), deleteFromBa
 
 // ==================== STATS ====================
 router.get("/stats", canView, getTaskStats);
+router.get("/scoreboard", getScoreboard); // own score + org leaderboard (any logged-in user)
 
 // ==================== CSV IMPORT (Task Calendar) ====================
 // CSV import — from the Tasks page (tasks.import) or the Task Calendar (calendar.import)
@@ -56,6 +61,13 @@ router.put("/:id", requirePermission("tasks", "edit"), uploadTaskFiles, updateTa
 // Status changes are part of doing the work — assignees need only tasks.view
 router.patch("/:id/status", canView, updateTaskStatus);
 router.delete("/:id", requirePermission("tasks", "delete"), deleteTask);
+
+// ==================== SUBTASKS ====================
+// adding / moving / removing is checked in the controller (assigner, Manager, Admin);
+// the assignee can tick their own subtasks
+router.post("/:id/subtasks", canView, addSubtask);
+router.patch("/:id/subtasks/:subId", canView, updateSubtask);
+router.delete("/:id/subtasks/:subId", canView, deleteSubtask);
 
 // ==================== ATTACHMENTS ====================
 router.post("/:id/attachments", canView, uploadTaskAttachments, addTaskAttachments);
