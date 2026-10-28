@@ -285,6 +285,107 @@ describe("Tasks — create with attachments, edit, delete, permissions", () => {
     assert.equal(st.status, 200);
   });
 
+  test("review flow: only the assigner completes (score + message to assignee) or sends back for rework", async () => {
+    const Notification = (await import("../src/models/Notification.js")).default;
+    const User = (await import("../src/models/User.js")).default;
+    const task = await Task.findById(ID.task);
+    const assigner = String(task.assignedBy);
+    const tokenOf = { [String((await User.findOne({ email: "alice@test.io" }))._id)]: T.alice };
+    assert.ok(!tokenOf[assigner], "task assigned by someone other than Alice");
+    const assignerToken = T.adminA;
+    const before = (await User.findOne({ email: "alice@test.io" })).points || 0;
+
+    // assignee can't complete — not even from Review
+    let r = await call("PATCH", `/api/tasks/${ID.task}/status`, { token: T.alice, json: { status: "Completed" } });
+    assert.equal(r.status, 403);
+    assert.equal(r.data.code, "ASSIGNER_ONLY");
+    // assigner can't skip Review
+    r = await call("PATCH", `/api/tasks/${ID.task}/status`, { token: assignerToken, json: { status: "Completed" } });
+    assert.equal(r.status, 409);
+
+    // assignee → Review; assigner sends it back for rework with a reason
+    assert.equal((await call("PATCH", `/api/tasks/${ID.task}/status`, { token: T.alice, json: { status: "Review" } })).status, 200);
+    assert.equal((await call("PATCH", `/api/tasks/${ID.task}/status`, { token: T.alice, json: { status: "Completed" } })).status, 403);
+    r = await call("PATCH", `/api/tasks/${ID.task}/status`, { token: assignerToken, json: { status: "In Progress", note: "Add the summary" } });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.equal(r.data.rework, true);
+    assert.equal(r.data.data.reworkCount, 1);
+    const rework = await Notification.findOne({ task: ID.task, type: "task_rework" });
+    assert.ok(rework && /Add the summary/.test(rework.message), "assignee told what to rework");
+
+    // back to Review → assigner approves → points + score in the message
+    await call("PATCH", `/api/tasks/${ID.task}/status`, { token: T.alice, json: { status: "Review" } });
+    // approving needs a score 1–10 from the assigner
+    r = await call("PATCH", `/api/tasks/${ID.task}/status`, { token: assignerToken, json: { status: "Completed" } });
+    assert.equal(r.status, 400);
+    assert.equal(r.data.code, "SCORE_REQUIRED");
+    assert.equal((await call("PATCH", `/api/tasks/${ID.task}/status`, { token: assignerToken, json: { status: "Completed", score: 11 } })).status, 400);
+    r = await call("PATCH", `/api/tasks/${ID.task}/status`, { token: assignerToken, json: { status: "Completed", score: 8 } });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    const t = await Task.findById(ID.task);
+    const reward = 8; // points = the score the assigner gave
+    assert.equal(t.reviewScore, 8);
+    assert.equal(r.data.data.reviewScore, 8);
+    assert.equal(r.data.score, before + reward);
+    assert.equal(t.pointsAwarded, reward);
+    assert.equal(r.data.celebration.earned, reward);
+    assert.equal(r.data.celebrateFor, String(t.assignedTo));
+    assert.ok(r.data.celebration.newBadges.some((b) => b.key === "first_win"), "first completed task → First Win badge");
+    const done = await Notification.findOne({ task: ID.task, type: "task_completed" });
+    assert.ok(done && done.message.includes("8/10") && done.message.includes(`total score is now ${before + reward}`), done?.message);
+    assert.ok(done.celebration && done.celebration.score === before + reward, "notification carries the win screen data");
+
+    const board = await call("GET", "/api/tasks/scoreboard", { token: T.alice });
+    assert.equal(board.status, 200, JSON.stringify(board.data));
+    assert.equal(board.data.data.me.points, before + reward);
+    assert.ok(board.data.data.me.badges.find((b) => b.key === "first_win").earned);
+    assert.ok(board.data.data.leaderboard.some((row) => row.name && row.level?.name), "leaderboard with levels");
+    assert.ok(!board.data.data.leaderboard.some((row) => row.name === "Bob"), "other organization not on the leaderboard");
+
+    // assignee can't reopen; assigner reopening takes the reward back
+    assert.equal((await call("PATCH", `/api/tasks/${ID.task}/status`, { token: T.alice, json: { status: "In Progress" } })).status, 403);
+    assert.equal((await call("PATCH", `/api/tasks/${ID.task}/status`, { token: assignerToken, json: { status: "In Progress" } })).status, 200);
+    assert.equal((await User.findOne({ email: "alice@test.io" })).points || 0, before);
+  });
+
+  test("subtasks: assigner assigns (with who assigned it), assignee ticks, moves within a shared task", async () => {
+    const Notification = (await import("../src/models/Notification.js")).default;
+    // shared task for Alice + Dan, created by the Admin
+    const g = await call("POST", "/api/tasks", { token: T.adminA, json: { name: "Launch prep", assignedUsers: [ID.alice, ID.dan], subtasks: [{ title: "Draft plan" }] } });
+    assert.equal(g.status, 201, JSON.stringify(g.data));
+    const copies = await Task.find({ name: "Launch prep" });
+    assert.equal(copies.length, 2);
+    const aliceTask = copies.find((t) => String(t.assignedTo) === ID.alice);
+    const danTask = copies.find((t) => String(t.assignedTo) === ID.dan);
+    assert.ok(aliceTask.subtasks[0].assignedByName, "creation records who assigned the subtask");
+
+    // assigner gives Alice a subtask → she is notified
+    let r = await call("POST", `/api/tasks/${aliceTask._id}/subtasks`, { token: T.adminA, json: { title: "Book the room" } });
+    assert.equal(r.status, 201, JSON.stringify(r.data));
+    const sub = r.data.data[0].subtasks.find((x) => x.title === "Book the room");
+    assert.ok(sub.assignedByName && sub.assignedAt);
+    assert.ok(await Notification.findOne({ recipient: ID.alice, type: "task_subtask" }));
+
+    // the assignee can't assign or move, but can tick her own
+    assert.equal((await call("POST", `/api/tasks/${aliceTask._id}/subtasks`, { token: T.alice, json: { title: "x" } })).status, 403);
+    assert.equal((await call("PATCH", `/api/tasks/${aliceTask._id}/subtasks/${sub._id}`, { token: T.alice, json: { moveTo: String(danTask._id) } })).status, 403);
+    r = await call("PATCH", `/api/tasks/${aliceTask._id}/subtasks/${sub._id}`, { token: T.alice, json: { completed: true } });
+    assert.equal(r.status, 200);
+    assert.ok(r.data.data[0].subtasks.find((x) => x._id === sub._id).completed);
+    // Dan can't tick Alice's subtask
+    assert.equal((await call("PATCH", `/api/tasks/${aliceTask._id}/subtasks/${sub._id}`, { token: T.dan, json: { completed: false } })).status, 404);
+
+    // assigner moves it to Dan
+    r = await call("PATCH", `/api/tasks/${aliceTask._id}/subtasks/${sub._id}`, { token: T.adminA, json: { moveTo: String(danTask._id) } });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.ok(!(await Task.findById(aliceTask._id)).subtasks.some((x) => x.title === "Book the room"));
+    assert.ok((await Task.findById(danTask._id)).subtasks.some((x) => x.title === "Book the room" && !x.completed));
+    // not to an unrelated task
+    assert.equal((await call("PATCH", `/api/tasks/${danTask._id}/subtasks/${(await Task.findById(danTask._id)).subtasks[0]._id}`, { token: T.adminA, json: { moveTo: ID.task } })).status, 400);
+
+    await Task.deleteMany({ name: "Launch prep" });
+  });
+
   test("other organization cannot see, edit or delete the task", async () => {
     assert.equal((await call("PATCH", `/api/tasks/${ID.task}`, { token: T.adminB, json: { name: "x" } })).status, 404);
     assert.equal((await call("DELETE", `/api/tasks/${ID.task}`, { token: T.adminB })).status, 404);
@@ -728,8 +829,8 @@ describe("Organization isolation — MoM meetings and support tickets", () => {
   test("meetings are visible only inside the creator's organization", async () => {
     const Meeting = (await import("../src/models/Meeting.js")).default;
     const m = await Meeting.create({ title: "Org A sync", meetingDate: new Date("2030-01-01"), createdBy: ID.adminA });
-    const listA = await call("GET", "/api/meetings", { token: T.alice });
-    assert.ok(listA.data.data.some((x) => x._id === String(m._id)), "same-org member sees it");
+    const listA = await call("GET", "/api/meetings", { token: T.adminA });
+    assert.ok(listA.data.data.some((x) => x._id === String(m._id)), "same-org admin sees it");
     const listB = await call("GET", "/api/meetings", { token: T.adminB });
     assert.ok(!listB.data.data.some((x) => x._id === String(m._id)), "other org does not");
     assert.equal((await call("GET", `/api/meetings/${m._id}`, { token: T.bob })).status, 404);
@@ -737,6 +838,31 @@ describe("Organization isolation — MoM meetings and support tickets", () => {
     assert.ok(await Meeting.findById(m._id), "not deleted by other org");
     const all = await call("GET", "/api/meetings", { token: T.super });
     assert.ok(all.data.data.some((x) => x._id === String(m._id)), "SuperAdmin sees all");
+  });
+
+  test("meetings: only the creator, invited attendees and the org admin; only creator / admin delete", async () => {
+    const m = await call("POST", "/api/meetings", { token: T.dan, json: {
+      title: "Dan's 1:1", meetingDate: "2031-09-01", meetingType: "Offline",
+      attendees: [{ name: "Alice", email: "alice@test.io", userId: ID.alice }],
+    } });
+    const id = m.data.data._id;
+    const sees = async (token) => (await call("GET", "/api/meetings", { token })).data.data.some((x) => x._id === id);
+    assert.equal(await sees(T.dan), true, "creator");
+    assert.equal(await sees(T.alice), true, "invited attendee");
+    assert.equal(await sees(T.adminA), true, "org admin");
+    assert.equal(await sees(T.mia), false, "same org (Manager), not invited");
+    assert.equal(await sees(T.adminB), false, "other org");
+    assert.equal((await call("GET", `/api/meetings/${id}`, { token: T.mia })).status, 404);
+    assert.equal((await call("GET", `/api/meetings/${id}/transcript`, { token: T.mia })).status, 404);
+    assert.equal((await call("PUT", `/api/meetings/${id}`, { token: T.mia, json: { title: "x" } })).status, 404);
+    assert.equal((await call("GET", `/api/meetings/${id}`, { token: T.alice })).status, 200);
+
+    // An attendee added by email only (no account link) also sees it
+    await call("PUT", `/api/meetings/${id}`, { token: T.dan, json: { attendees: [{ name: "Alice", email: "alice@test.io", userId: ID.alice }, { name: "Mia", email: "mia@test.io" }] } });
+    assert.equal(await sees(T.mia), true, "invited by email");
+
+    assert.equal((await call("DELETE", `/api/meetings/${id}`, { token: T.alice })).status, 403, "attendee cannot delete");
+    assert.equal((await call("DELETE", `/api/meetings/${id}`, { token: T.dan })).status, 200, "creator deletes");
   });
 
   test("tickets: owner + own org admin only", async () => {
@@ -948,7 +1074,7 @@ describe("MoM — transcript from the recording (local Whisper)", () => {
     const up = await upload(id, T.adminA);
     assert.equal(up.status, 201, JSON.stringify(up.data));
     assert.equal(up.data.transcribing, true);
-    const t = await poll(id, T.alice, (x) => x?.status === "done");
+    const t = await poll(id, T.adminA, (x) => x?.status === "done");
     assert.equal(t.status, "done");
     assert.equal(t.source, "whisper");
     assert.deepEqual(t.entries.map((e) => [e.text, e.offsetSec]), [["Welcome everyone", 0], ["Let's review the sprint", 4.2]]);
@@ -971,6 +1097,248 @@ describe("MoM — transcript from the recording (local Whisper)", () => {
     const noRec = await call("POST", "/api/meetings", { token: T.adminA, json: { title: "No rec", meetingDate: "2031-06-02", meetingType: "Offline" } });
     assert.equal((await call("POST", `/api/meetings/${noRec.data.data._id}/transcript/whisper`, { token: T.adminA })).status, 400);
     assert.equal((await call("POST", `/api/meetings/${ID.whisperMeeting}/transcript/whisper`, { token: T.adminB })).status, 404);
+  });
+});
+
+describe("MoM — transcription language and speakers", () => {
+  const poll = async (id, token, until) => {
+    const end = Date.now() + 4000;
+    let last;
+    while (Date.now() < end) {
+      last = (await call("GET", `/api/meetings/${id}/transcript`, { token })).data.data.transcript;
+      if (until(last)) return last;
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    return last;
+  };
+  const upload = (id, token, language) => {
+    const f = new FormData();
+    if (language) f.append("language", language);
+    f.append("durationSec", "12");
+    f.append("recording", new Blob([Buffer.alloc(4096, 3)], { type: "audio/mpeg" }), "call.mp3");
+    return call("POST", `/api/meetings/${id}/recording`, { token, form: f });
+  };
+  let mid;
+
+  test("language list, English default, validation on create / update / upload", async () => {
+    const l = await call("GET", "/api/meetings/transcription-languages", { token: T.alice });
+    assert.equal(l.status, 200);
+    assert.equal(l.data.data.default, "en");
+    const codes = l.data.data.languages.map((x) => x.code);
+    for (const c of ["en", "ta", "hi", "te", "ml", "kn"]) assert.ok(codes.includes(c), c);
+
+    const m = await call("POST", "/api/meetings", { token: T.adminA, json: {
+      title: "Lang sync", meetingDate: "2031-07-01", meetingType: "Offline", transcription: true, recording: true,
+      attendees: [{ name: "Alice", email: "alice@test.io", userId: ID.alice }, { name: "Dan", email: "dan@test.io", userId: ID.dan }],
+    } });
+    mid = m.data.data._id;
+    assert.equal(m.data.data.transcriptionLanguage, "en");
+    assert.equal((await call("POST", "/api/meetings", { token: T.adminA, json: { title: "Bad", meetingDate: "2031-07-01", meetingType: "Offline", transcriptionLanguage: "xx" } })).status, 400);
+    assert.equal((await call("PUT", `/api/meetings/${mid}/transcript/language`, { token: T.adminA, json: { language: "klingon" } })).status, 400);
+    const ok = await call("PUT", `/api/meetings/${mid}/transcript/language`, { token: T.adminA, json: { language: "auto" } });
+    assert.equal(ok.data.data.transcriptionLanguage, "auto");
+    assert.equal((await call("PUT", `/api/meetings/${mid}/transcript/language`, { token: T.adminB, json: { language: "ta" } })).status, 404);
+    assert.equal((await upload(mid, T.adminA, "zz")).status, 400);
+  });
+
+  test("uploaded audio is transcribed in the chosen language, split by speaker", async () => {
+    const { setTranscriber } = await import("../src/services/transcriptionService.js");
+    let seen;
+    setTranscriber(async (file, options) => {
+      seen = options;
+      return { seconds: 9, language: "ta", segments: [
+        { text: "Vanakkam", start: 0, end: 2, speakerIndex: 0 },
+        { text: "Hello", start: 2, end: 4, speakerIndex: 1 },
+        { text: "Let's start", start: 4, end: 6, speakerIndex: 0 },
+      ] };
+    });
+    const up = await upload(mid, T.adminA, "ta");
+    assert.equal(up.status, 201, JSON.stringify(up.data));
+    const t = await poll(mid, T.adminA, (x) => x?.status === "done");
+    assert.equal(seen.language, "ta");
+    assert.equal(seen.maxSpeakers, 3);
+    assert.equal(t.language, "ta");
+    assert.deepEqual(t.entries.map((e) => [e.speaker, e.speakerId, e.offsetSec, e.endSec]), [
+      ["Speaker 1", "S1", 0, 2], ["Speaker 2", "S2", 2, 4], ["Speaker 1", "S1", 4, 6],
+    ]);
+    assert.deepEqual(t.speakers.map((s) => s.label), ["Speaker 1", "Speaker 2"]);
+
+    // re-run with auto-detect → detected language is kept
+    await call("POST", `/api/meetings/${mid}/transcript/whisper`, { token: T.adminA, json: { language: "auto" } });
+    const t2 = await poll(mid, T.adminA, (x) => x?.status === "done" && x.language === "auto");
+    assert.equal(seen.language, "auto");
+    assert.equal(t2.detectedLanguage, "ta");
+    assert.equal((await call("POST", `/api/meetings/${mid}/transcript/whisper`, { token: T.adminA, json: { language: "nope" } })).status, 400);
+  });
+
+  test("assigning attendees renames every line; unassign restores the label; guards", async () => {
+    const r = await call("PUT", `/api/meetings/${mid}/transcript/speakers`, { token: T.adminA, json: { speakers: [
+      { id: "S1", name: "Alice", userId: ID.alice }, { id: "S2", name: "Dan", userId: ID.dan },
+    ] } });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.deepEqual(r.data.data.transcript.entries.map((e) => e.speaker), ["Alice", "Dan", "Alice"]);
+    assert.equal(r.data.data.transcript.speakers[0].email, "alice@test.io");
+    const again = (await call("GET", `/api/meetings/${mid}`, { token: T.alice })).data.data.transcript;
+    assert.deepEqual(again.entries.map((e) => e.speaker), ["Alice", "Dan", "Alice"]);
+
+    // Every read path shows the mapped name — even if a line still has an old label stored
+    await Meeting().updateOne({ _id: mid }, { $set: { "transcript.entries.1.speaker": "Speaker 2" } });
+    const byId = (await call("GET", `/api/meetings/${mid}`, { token: T.alice })).data.data.transcript;
+    const list = (await call("GET", "/api/meetings", { token: T.alice })).data.data.find((x) => x._id === mid).transcript;
+    const tr = (await call("GET", `/api/meetings/${mid}/transcript`, { token: T.alice })).data.data.transcript;
+    for (const t of [byId, list, tr]) assert.deepEqual(t.entries.map((e) => e.speaker), ["Alice", "Dan", "Alice"]);
+
+    const back = await call("PUT", `/api/meetings/${mid}/transcript/speakers`, { token: T.adminA, json: { speakers: [{ id: "S2", name: "" }] } });
+    assert.deepEqual(back.data.data.transcript.entries.map((e) => e.speaker), ["Alice", "Speaker 2", "Alice"]);
+    assert.equal((await call("PUT", `/api/meetings/${mid}/transcript/speakers`, { token: T.adminA, json: { speakers: [{ id: "S9", name: "X" }] } })).status, 400);
+    assert.equal((await call("PUT", `/api/meetings/${mid}/transcript/speakers`, { token: T.adminB, json: { speakers: [{ id: "S1", name: "X" }] } })).status, 404);
+  });
+
+  test("editing a line: text, speaker, split to a new speaker, conflict guard", async () => {
+    const url = `/api/meetings/${mid}/transcript/entries`;
+    const e = await call("PATCH", `${url}/1`, { token: T.adminA, json: { text: "Hello all", speakerId: "S1", original: "Hello" } });
+    assert.equal(e.status, 200, JSON.stringify(e.data));
+    const line = e.data.data.transcript.entries[1];
+    assert.deepEqual([line.text, line.speaker, line.edited], ["Hello all", "Alice", true]);
+    const split = await call("PATCH", `${url}/2`, { token: T.adminA, json: { speakerId: "new" } });
+    assert.equal(split.data.data.transcript.entries[2].speaker, "Speaker 3");
+    assert.equal((await call("PATCH", `${url}/1`, { token: T.adminA, json: { text: "x", original: "stale" } })).status, 409);
+    assert.equal((await call("PATCH", `${url}/1`, { token: T.adminA, json: { text: "  " } })).status, 400);
+    assert.equal((await call("PATCH", `${url}/99`, { token: T.adminA, json: { text: "x" } })).status, 404);
+    assert.equal((await call("PATCH", `${url}/0`, { token: T.adminA, json: { speakerId: "S42" } })).status, 400);
+  });
+
+  test("imported / Google names that match an attendee are linked; others stay as labels", async () => {
+    const imp = await call("POST", `/api/meetings/${mid}/transcript/import`, { token: T.adminA, json: { text: "Alice: Hi\nGuest: Hello\nAlice: Bye" } });
+    const t = imp.data.data.transcript;
+    assert.deepEqual(t.entries.map((e) => e.speakerId), ["S1", "S2", "S1"]);
+    assert.equal(String(t.speakers[0].userId), ID.alice);
+    assert.equal(t.speakers[1].name, "");
+  });
+});
+
+describe("MoM — speaker names from voice profiles", () => {
+  const poll = async (id, token, until) => {
+    const end = Date.now() + 4000;
+    let last;
+    while (Date.now() < end) {
+      last = (await call("GET", `/api/meetings/${id}/transcript`, { token })).data.data.transcript;
+      if (until(last)) return last;
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    return last;
+  };
+  const sample = (consent = "1") => {
+    const f = new FormData();
+    f.append("consent", consent);
+    f.append("sample", new Blob([Buffer.alloc(2048, 1)], { type: "audio/webm" }), "voice.webm");
+    return f;
+  };
+  const ALICE = [1, 0, 0, 0], DAN = [0, 1, 0, 0], STRANGER = [0, 0, 1, 0];
+  let mid;
+
+  test("record / read / delete my voice profile (consent required, vector never returned)", async () => {
+    const svc = await import("../src/services/transcriptionService.js");
+    svc.setVoiceprinter(async () => ({ embedding: ALICE, seconds: 9 }));
+    assert.equal((await call("POST", "/api/meetings/voice-profile", { token: T.alice, form: sample("0") })).status, 400);
+    const r = await call("POST", "/api/meetings/voice-profile", { token: T.alice, form: sample() });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.equal(r.data.data.enrolled, true);
+    const g = await call("GET", "/api/meetings/voice-profile", { token: T.alice });
+    assert.deepEqual([g.data.data.enrolled, g.data.data.seconds], [true, 9]);
+    assert.equal(JSON.stringify(g.data).includes("embedding"), false);
+    assert.equal((await call("GET", "/api/meetings/voice-profile", { token: T.dan })).data.data.enrolled, false);
+
+    svc.setVoiceprinter(async () => { throw new Error("Not enough speech in the sample"); });
+    const bad = await call("POST", "/api/meetings/voice-profile", { token: T.dan, form: sample() });
+    assert.equal(bad.status, 422);
+    assert.match(bad.data.message, /Not enough speech/);
+    const leftovers = (await import("node:fs")).readdirSync((await import("../src/controllers/meetingMediaController.js")).RECORDING_DIR).filter((f) => f.startsWith("voice-"));
+    assert.deepEqual(leftovers, [], "voice samples are deleted after processing");
+  });
+
+  test("transcription names the speakers whose voice matches an attendee's profile", async () => {
+    const svc = await import("../src/services/transcriptionService.js");
+    svc.setTranscriber(async () => ({
+      seconds: 9,
+      segments: [
+        { text: "Good morning, everyone.", start: 0, end: 3, speakerIndex: 0 },
+        { text: "Let us start the meeting.", start: 3, end: 6, speakerIndex: 1 },
+        { text: "Agenda first.", start: 6, end: 9, speakerIndex: 0 },
+      ],
+      voiceprints: [{ index: 0, embedding: [0.97, 0.05, 0.1, 0] }, { index: 1, embedding: [0.1, 0.95, 0.05, 0] }],
+    }));
+    const m = await call("POST", "/api/meetings", { token: T.adminA, json: {
+      title: "Voice sync", meetingDate: "2031-08-01", meetingType: "Offline", transcription: true, recording: true,
+      attendees: [{ name: "Alice", email: "alice@test.io", userId: ID.alice }, { name: "Dan", email: "dan@test.io", userId: ID.dan }],
+    } });
+    mid = m.data.data._id;
+    const f = new FormData();
+    f.append("recording", new Blob([Buffer.alloc(4096, 3)], { type: "audio/mpeg" }), "call.mp3");
+    await call("POST", `/api/meetings/${mid}/recording`, { token: T.adminA, form: f });
+    const t = await poll(mid, T.adminA, (x) => x?.status === "done");
+    // Alice has a profile → named; Dan has none → stays "Speaker 2"
+    assert.deepEqual(t.entries.map((e) => e.speaker), ["Alice", "Speaker 2", "Alice"]);
+    assert.equal(t.speakers[0].matchedBy, "voice");
+    assert.equal(t.voiceprints, undefined, "voice data is not sent to the browser");
+    const list = (await call("GET", "/api/meetings", { token: T.adminA })).data.data.find((x) => x._id === mid);
+    assert.equal(list.transcript.voiceprints, undefined);
+  });
+
+  test("“Recognize speakers” after someone records a profile; manual names are kept", async () => {
+    const svc = await import("../src/services/transcriptionService.js");
+    svc.setVoiceprinter(async () => ({ embedding: DAN, seconds: 10 }));
+    await call("POST", "/api/meetings/voice-profile", { token: T.dan, form: sample() });
+    const r = await call("POST", `/api/meetings/${mid}/transcript/identify`, { token: T.adminA });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.deepEqual(r.data.data.transcript.entries.map((e) => e.speaker), ["Alice", "Dan", "Alice"]);
+    assert.equal(r.data.data.transcript.voiceprints, undefined);
+
+    // A name chosen by hand wins over the voice match
+    await call("PUT", `/api/meetings/${mid}/transcript/speakers`, { token: T.adminA, json: { speakers: [{ id: "S1", name: "Guest Speaker" }] } });
+    const again = await call("POST", `/api/meetings/${mid}/transcript/identify`, { token: T.adminA });
+    assert.deepEqual(again.data.data.transcript.entries.map((e) => e.speaker), ["Guest Speaker", "Dan", "Guest Speaker"]);
+
+    // Deleting a profile → that person is no longer recognized on the next run
+    await call("DELETE", "/api/meetings/voice-profile", { token: T.dan });
+    const after = await call("POST", `/api/meetings/${mid}/transcript/identify`, { token: T.adminA });
+    assert.equal(after.data.data.transcript.entries[1].speaker, "Speaker 2");
+  });
+
+  test("voice matching: threshold and ambiguity guard", async () => {
+    const { matchVoices } = await import("../src/utils/voiceMatch.js");
+    const profiles = [{ key: "a", embedding: ALICE }, { key: "d", embedding: DAN }];
+    assert.deepEqual(matchVoices([{ id: "S1", embedding: [0.9, 0.1, 0, 0] }], profiles).map((m) => m.key), ["a"]);
+    assert.deepEqual(matchVoices([{ id: "S1", embedding: STRANGER }], profiles), [], "unknown voice → not named");
+    assert.deepEqual(matchVoices([{ id: "S1", embedding: [1, 0.95, 0, 0] }], profiles), [], "between two people → not named");
+  });
+});
+
+describe("Whisper output cleanup", () => {
+  test("drops tags and repetition loops, merges a repeated line", async () => {
+    const { cleanSegmentText, cleanSegments } = await import("../src/utils/transcriptCleanup.js");
+    assert.equal(cleanSegmentText("(inaudible) I'm not sure what I'm going to do."), "I'm not sure what I'm going to do.");
+    assert.equal(cleanSegmentText("I'm going to get a Tamil language. I'm going to get a Tamil language."), "I'm going to get a Tamil language.");
+    assert.equal(cleanSegmentText("அம்மா, அம்மா, அம்மா, அம்மா"), "அம்மா");
+    assert.equal(cleanSegmentText("[BLANK_AUDIO] [Music]"), "");
+    const out = cleanSegments([
+      { text: "(inaudible)", start: 0, end: 30 },
+      { text: "Hello team.", start: 30, end: 33 },
+      { text: "hello team", start: 33, end: 35 },
+      { text: "Next item.", start: 35, end: 38 },
+    ]);
+    assert.deepEqual(out.map((s) => [s.text, s.start, s.end]), [["Hello team.", 30, 35], ["Next item.", 35, 38]]);
+  });
+});
+
+describe("speaker clustering", () => {
+  test("groups similar voices, keeps order of appearance, fills short lines", async () => {
+    const { clusterSpeakers } = await import("../src/utils/speakerClustering.js");
+    const a = [1, 0.1, 0], b = [0, 1, 0.1], a2 = [0.95, 0.15, 0.05];
+    assert.deepEqual(clusterSpeakers([b, a, null, a2, b], [3, 3, 0.5, 3, 3]), [0, 1, 1, 1, 0]);
+    assert.deepEqual(clusterSpeakers([a, b, a2], [3, 3, 3], { maxSpeakers: 1 }), [0, 0, 0]);
+    assert.deepEqual(clusterSpeakers([a, b, a2], [3, 0.5, 3]), [0, 0, 0], "a voice heard for < 2 s is folded in");
+    assert.deepEqual(clusterSpeakers([null, null], [1, 1]), [0, 0]);
   });
 });
 
@@ -1243,6 +1611,58 @@ describe("Chat: groups, attachments, permissions", () => {
     // Team Members can't create groups by default
     assert.equal((await call("POST", "/api/chat/groups", { token: T.alice, json: { name: "x", memberIds: [ID.mia] } })).status, 403);
     assert.equal((await call("POST", `/api/chat/groups/${ID.group}/leave`, { token: T.mia })).status, 200);
+  });
+
+  test("disappearing messages: group admin toggles, members can't, messages expire and are swept", async () => {
+    // plain member (Alice) can't change it; invalid duration refused
+    assert.equal((await call("PUT", `/api/chat/${ID.group}/disappearing`, { token: T.alice, json: { seconds: 86400 } })).status, 403);
+    assert.equal((await call("PUT", `/api/chat/${ID.group}/disappearing`, { token: T.adminA, json: { seconds: 5 } })).status, 400);
+
+    const on = await call("PUT", `/api/chat/${ID.group}/disappearing`, { token: T.adminA, json: { seconds: 3600 } });
+    assert.equal(on.status, 200, JSON.stringify(on.data));
+    assert.equal(on.data.conversation.disappearAfter, 3600);
+    assert.ok(on.data.message.system && /turned on disappearing/.test(on.data.message.text));
+
+    const m = await call("POST", `/api/chat/${ID.group}/messages`, { token: T.alice, json: { text: "secret soon gone" } });
+    assert.equal(m.status, 201);
+    const left = new Date(m.data.message.expiresAt).getTime() - Date.now();
+    assert.ok(left > 3500e3 && left <= 3600e3, "expires in ~1 hour");
+
+    // pretend the hour passed → hidden at once, then deleted by the sweep
+    const { default: Message } = await import("../src/models/Message.js");
+    await Message.updateOne({ _id: m.data.message._id }, { expiresAt: new Date(Date.now() - 1000) });
+    const read = await call("GET", `/api/chat/${ID.group}/messages`, { token: T.alice });
+    assert.ok(!read.data.messages.some((x) => x.text === "secret soon gone"), "expired message hidden");
+    assert.ok(read.data.messages.some((x) => x.text === "Hello group 👋"), "older messages untouched");
+    const { sweepExpiredMessages } = await import("../src/jobs/chatExpiryJob.js");
+    assert.ok((await sweepExpiredMessages()) >= 1);
+    assert.equal(await Message.countDocuments({ _id: m.data.message._id }), 0);
+
+    // a file in a disappearing message → message deleted, file kept in the chat file backup
+    const f = new FormData();
+    f.append("files", new Blob(["%PDF-1.4 keep me"], { type: "application/pdf" }), "keep.pdf");
+    const fm = await call("POST", `/api/chat/${ID.group}/messages`, { token: T.alice, form: f });
+    assert.equal(fm.status, 201, JSON.stringify(fm.data));
+    await Message.updateOne({ _id: fm.data.message._id }, { expiresAt: new Date(Date.now() - 1000) });
+    await sweepExpiredMessages();
+    assert.equal(await Message.countDocuments({ _id: fm.data.message._id }), 0, "message deleted");
+
+    const mine = await call("GET", "/api/chat/backup?search=keep", { token: T.alice });
+    assert.equal(mine.status, 200, JSON.stringify(mine.data));
+    const rec = mine.data.data.find((r) => r.name === "keep.pdf");
+    assert.ok(rec && rec.location === "backup", "file listed as backed up");
+    assert.equal(mine.data.canDelete, false);
+    const dl = await call("GET", `/api/chat/backup/${rec._id}/download`, { token: T.adminA });
+    assert.equal(dl.status, 200, "admin can download the backed-up file");
+    assert.equal((await call("GET", `/api/chat/backup/${rec._id}/download`, { token: T.bob })).status, 404, "other org can't");
+    assert.equal((await call("GET", "/api/chat/backup?search=keep", { token: T.bob })).data.data.length, 0);
+    assert.equal((await call("DELETE", `/api/chat/backup/${rec._id}`, { token: T.alice })).status, 403);
+    assert.equal((await call("DELETE", `/api/chat/backup/${rec._id}`, { token: T.adminA })).status, 200);
+
+    const off = await call("PUT", `/api/chat/${ID.group}/disappearing`, { token: T.adminA, json: { seconds: 0 } });
+    assert.equal(off.data.conversation.disappearAfter, 0);
+    const kept = await call("POST", `/api/chat/${ID.group}/messages`, { token: T.alice, json: { text: "stays" } });
+    assert.equal(kept.data.message.expiresAt, null);
   });
 
   test("attachments: upload, member download, outsider blocked, type/size checks, permission", async () => {
