@@ -1,5 +1,6 @@
 import mongoose from "mongoose";
 import { emitToUser } from "../socket/realtime.js";
+import { pushNotificationDoc } from "../services/pushService.js";
 
 // In-app notifications (dashboard panel). Emails are sent alongside when allowed.
 export const NOTIFICATION_TYPES = [
@@ -33,6 +34,8 @@ notificationSchema.index({ recipient: 1, createdAt: -1 });
 notificationSchema.post("save", function (doc) {
   if (this.$locals.wasNew === false) return;
   emitToUser(doc.recipient, "notification:new", doc.toObject());
+  // ...and to the recipient's browsers as a push notification, even with the app closed
+  pushNotificationDoc(doc).catch((err) => console.error("[push]", err.message));
 });
 notificationSchema.pre("save", function (next) {
   this.$locals.wasNew = this.isNew;
