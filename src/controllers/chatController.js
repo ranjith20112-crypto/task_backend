@@ -778,13 +778,6 @@ export const sendMessage = async (req, res) => {
       });
     }
 
-    if (text.length > 5000) {
-      return res.status(400).json({
-        success: false,
-        message: "Message cannot exceed 5000 characters.",
-      });
-    }
-
     const organizationId = getRequestOrganizationId(req, currentUser);
     const accessFilter = await getConversationAccessFilter(
       currentUser,
