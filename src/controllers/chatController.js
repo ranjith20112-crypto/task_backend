@@ -3,7 +3,8 @@ import mongoose from "mongoose";
 import User from "../models/User.js";
 import Department from "../models/Department.js";
 import Conversation from "../models/Conversation.js";
-import Message from "../models/Message.js";
+import Message, { notExpired } from "../models/Message.js";
+import { recordChatFiles } from "../services/chatBackupService.js";
 
 /* =====================================================
    HELPERS
@@ -138,6 +139,7 @@ async function getUnreadCounts(conversationIds, userId) {
         },
         sender: { $ne: userObjectId },
         readBy: { $ne: userObjectId },
+        ...notExpired(),
       },
     },
     {
@@ -502,7 +504,7 @@ export const createDepartmentConversation = async (req, res) => {
       .populate("participants", "name email department role status")
       .populate({
         path: "lastMessage",
-        select: "text attachments sender createdAt",
+        select: "text attachments sender createdAt expiresAt system",
         populate: { path: "sender", select: "name" },
       });
 
@@ -557,7 +559,7 @@ export const getConversations = async (req, res) => {
       .populate("department", "name description")
       .populate({
         path: "lastMessage",
-        select: "text attachments sender createdAt",
+        select: "text attachments sender createdAt expiresAt system",
         populate: { path: "sender", select: "name" },
       })
       .sort({ lastMessageAt: -1, updatedAt: -1 })
@@ -589,8 +591,14 @@ export const getConversations = async (req, res) => {
       currentUser._id
     );
 
+    // an expired last message is hidden until jobs/chatExpiryJob.js removes it
+    const now = Date.now();
     const result = visibleConversations.map((conversation) => ({
       ...conversation,
+      lastMessage:
+        conversation.lastMessage?.expiresAt && new Date(conversation.lastMessage.expiresAt).getTime() <= now
+          ? null
+          : conversation.lastMessage,
       unreadCount: unreadCounts[String(conversation._id)] || 0,
     }));
 
@@ -691,6 +699,7 @@ export const getMessages = async (req, res) => {
 
     const messages = await Message.find({
       conversation: conversation._id,
+      ...notExpired(),
     })
       .populate("sender", "name email")
       .sort({ createdAt: 1 })
@@ -822,6 +831,10 @@ export const sendMessage = async (req, res) => {
         mimetype: f.mimetype,
       })),
       readBy: [currentUser._id],
+      expiresAt:
+        conversation.disappearAfter > 0
+          ? new Date(Date.now() + conversation.disappearAfter * 1000)
+          : null,
     });
 
     conversation.lastMessage = message._id;
@@ -830,6 +843,19 @@ export const sendMessage = async (req, res) => {
 
     const populatedMessage = await Message.findById(message._id)
       .populate("sender", "name email");
+
+    // Every shared file is kept in the chat file backup (Settings → Chat file backup)
+    if (message.attachments?.length) {
+      try {
+        const recipients = await getConversationRecipientIds(conversation, currentUser._id);
+        await recordChatFiles(message, conversation, {
+          senderName: currentUser.name || "",
+          visibleTo: recipients,
+        });
+      } catch (err) {
+        console.error("chat file backup:", err.message);
+      }
+    }
 
     const io = getSocketIO(req);
 
@@ -844,6 +870,7 @@ export const sendMessage = async (req, res) => {
           conversation: conversation._id,
           sender: { $ne: recipientId },
           readBy: { $ne: recipientId },
+          ...notExpired(),
         });
 
         emitToUser(io, recipientId, "chat:message:new", {
@@ -867,6 +894,152 @@ export const sendMessage = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Unable to send message.",
+    });
+  }
+};
+
+/* =====================================================
+   PUT /api/chat/:conversationId/disappearing
+   body: { seconds: 0 | 3600 | 86400 | 604800 | 7776000 }
+   Applies to messages sent after the change.
+   Private chat → either person · Group → group admins / org Admin
+   Department → Admin / Manager / SuperAdmin
+===================================================== */
+
+export const DISAPPEAR_OPTIONS = {
+  0: "Off",
+  3600: "1 hour",
+  86400: "24 hours",
+  604800: "7 days",
+  7776000: "90 days",
+};
+
+export const setDisappearingMessages = async (req, res) => {
+  try {
+    const currentUser = await getAuthenticatedUser(req);
+    const { conversationId } = req.params;
+    const seconds = Number(req.body?.seconds);
+
+    if (!currentUser || currentUser.status !== "Active") {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required.",
+      });
+    }
+
+    if (!mongoose.isValidObjectId(conversationId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid conversation ID.",
+      });
+    }
+
+    if (!Object.prototype.hasOwnProperty.call(DISAPPEAR_OPTIONS, seconds)) {
+      return res.status(400).json({
+        success: false,
+        message: `Choose one of: ${Object.values(DISAPPEAR_OPTIONS).join(", ")}.`,
+      });
+    }
+
+    const organizationId = getRequestOrganizationId(req, currentUser);
+    const accessFilter = await getConversationAccessFilter(
+      currentUser,
+      organizationId
+    );
+
+    const conversation = await Conversation.findOne({
+      _id: conversationId,
+      ...accessFilter,
+    });
+
+    if (!conversation) {
+      return res.status(403).json({
+        success: false,
+        message: "You do not have access to this conversation.",
+      });
+    }
+
+    const role = currentUser.role;
+    let allowed = false;
+
+    if (conversation.type === "private") {
+      allowed = (conversation.participants || []).some((id) => sameId(id, currentUser._id));
+    } else if (conversation.type === "group") {
+      allowed =
+        role === "SuperAdmin" ||
+        sameId(conversation.admin_id, currentUser._id) ||
+        (conversation.groupAdmins || []).some((id) => sameId(id, currentUser._id));
+    } else if (conversation.type === "department") {
+      const department = await Department.findById(conversation.department);
+      allowed =
+        ["SuperAdmin", "Admin", "Manager"].includes(role) &&
+        (await canAccessDepartment(currentUser, department, organizationId));
+    }
+
+    if (!allowed) {
+      return res.status(403).json({
+        success: false,
+        message:
+          conversation.type === "group"
+            ? "Only group admins can change disappearing messages."
+            : "Only an Admin or Manager can change disappearing messages for a department chat.",
+      });
+    }
+
+    if ((conversation.disappearAfter || 0) === seconds) {
+      return res.status(200).json({ success: true, conversation });
+    }
+
+    conversation.disappearAfter = seconds;
+    conversation.disappearSetBy = currentUser._id;
+    conversation.disappearSetAt = new Date();
+
+    // A note in the chat so everyone sees the change (the note itself never disappears)
+    const note = await Message.create({
+      conversation: conversation._id,
+      sender: currentUser._id,
+      system: true,
+      text: seconds
+        ? `${currentUser.name || "Someone"} turned on disappearing messages. New messages will disappear ${DISAPPEAR_OPTIONS[seconds]} after they're sent.`
+        : `${currentUser.name || "Someone"} turned off disappearing messages.`,
+      readBy: [currentUser._id],
+    });
+
+    conversation.lastMessage = note._id;
+    conversation.lastMessageAt = note.createdAt || new Date();
+    await conversation.save();
+
+    const populatedNote = await Message.findById(note._id).populate("sender", "name email");
+    const io = getSocketIO(req);
+
+    if (io) {
+      const recipientIds = await getConversationRecipientIds(conversation, currentUser._id);
+      const payload = {
+        conversationId: String(conversation._id),
+        disappearAfter: seconds,
+      };
+
+      for (const recipientId of [...recipientIds, String(currentUser._id)]) {
+        emitToUser(io, recipientId, "chat:conversation:update", payload);
+      }
+      for (const recipientId of recipientIds) {
+        emitToUser(io, recipientId, "chat:message:new", {
+          conversationId: String(conversation._id),
+          message: populatedNote,
+        });
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      conversation,
+      message: populatedNote,
+    });
+  } catch (error) {
+    console.error("setDisappearingMessages:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to change disappearing messages.",
     });
   }
 };
