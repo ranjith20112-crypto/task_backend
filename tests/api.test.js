@@ -9,6 +9,14 @@ process.env.JWT_SECRET = "test-secret-only-for-tests";
 // Never talk to the real Google account / mailbox from tests (.env would load them)
 for (const k of ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN", "SMTP_USER", "SMTP_PASS"]) process.env[k] = "";
 process.env.NODE_ENV = "test";
+// Throwaway push keys (dotenv never overrides these), pushes go to a fake sender below
+{
+  const webpush = (await import("web-push")).default;
+  const keys = webpush.generateVAPIDKeys();
+  process.env.VAPID_PUBLIC_KEY = keys.publicKey;
+  process.env.VAPID_PRIVATE_KEY = keys.privateKey;
+  process.env.VAPID_SUBJECT = "mailto:test@example.test";
+}
 
 const { MongoMemoryServer } = await import("mongodb-memory-server");
 const mongoose = (await import("mongoose")).default;
@@ -1786,5 +1794,71 @@ describe("Regression — MoM and charts", () => {
     const r = await call("GET", "/api/tasks/stats", { token: T.adminA });
     assert.equal(r.status, 200);
     assert.ok(r.data.data.total >= 1);
+  });
+});
+
+describe("Push notifications", () => {
+  const sent = [];
+  const Notification = () => mongoose.model("Notification");
+  const waitFor = async (check) => {
+    for (let i = 0; i < 50 && !check(); i += 1) await new Promise((r) => setTimeout(r, 20));
+  };
+  const sub = (n) => ({ endpoint: `https://push.example.test/sub-${n}`, keys: { p256dh: `p256-${n}`, auth: `auth-${n}` } });
+
+  before(async () => {
+    const { setPushSender } = await import("../src/services/pushService.js");
+    setPushSender(async (subscription, body) => {
+      if (subscription.endpoint.endsWith("gone")) throw Object.assign(new Error("gone"), { statusCode: 410 });
+      sent.push({ endpoint: subscription.endpoint, payload: JSON.parse(body) });
+    });
+  });
+
+  test("public key needs login and is returned", async () => {
+    assert.equal((await call("GET", "/api/push/public-key")).status, 401);
+    const r = await call("GET", "/api/push/public-key", { token: T.alice });
+    assert.equal(r.status, 200);
+    assert.equal(r.data.publicKey, process.env.VAPID_PUBLIC_KEY);
+  });
+
+  test("subscribe validates the subscription", async () => {
+    const bad = await call("POST", "/api/push/subscribe", { token: T.alice, json: { subscription: { endpoint: "http://x", keys: {} } } });
+    assert.equal(bad.status, 400);
+    const ok = await call("POST", "/api/push/subscribe", { token: T.alice, json: { subscription: sub("a1") } });
+    assert.equal(ok.status, 200);
+  });
+
+  test("every new notification is pushed to the recipient's browsers", async () => {
+    sent.length = 0;
+    const me = (await call("GET", "/api/auth/me", { token: T.alice })).data.data;
+    await Notification().create({ recipient: me._id, type: "task_assigned", taskName: "Push test", message: "You have a new task: Push test" });
+    await waitFor(() => sent.length > 0);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].endpoint, sub("a1").endpoint);
+    assert.equal(sent[0].payload.title, "New task assigned");
+    assert.equal(sent[0].payload.url, "/dashboard/tasks");
+    assert.match(sent[0].payload.body, /Push test/);
+  });
+
+  test("dead subscriptions are removed; Settings off stops pushes; unsubscribe works", async () => {
+    const PushSubscription = mongoose.model("PushSubscription");
+    const me = (await call("GET", "/api/auth/me", { token: T.alice })).data.data;
+    await call("POST", "/api/push/subscribe", { token: T.alice, json: { subscription: sub("gone") } });
+
+    sent.length = 0;
+    await Notification().create({ recipient: me._id, type: "task_reminder", message: "Reminder" });
+    await waitFor(() => sent.length > 0);
+    await waitFor(() => false); // let the 410 cleanup finish
+    assert.equal(await PushSubscription.countDocuments({ endpoint: sub("gone").endpoint }), 0, "410 subscription deleted");
+
+    await User.updateOne({ _id: me._id }, { "preferences.desktopNotifications": false });
+    sent.length = 0;
+    await Notification().create({ recipient: me._id, type: "task_reminder", message: "Muted" });
+    await waitFor(() => false);
+    assert.equal(sent.length, 0, "muted in Settings");
+    await User.updateOne({ _id: me._id }, { "preferences.desktopNotifications": true });
+
+    const un = await call("POST", "/api/push/unsubscribe", { token: T.alice, json: { endpoint: sub("a1").endpoint } });
+    assert.equal(un.status, 200);
+    assert.equal(await PushSubscription.countDocuments({ user: me._id }), 0);
   });
 });
