@@ -688,14 +688,29 @@ export const getMessages = async (req, res) => {
       }
     }
 
-    await Message.updateMany(
-      {
-        conversation: conversation._id,
-        sender: { $ne: currentUser._id },
-        readBy: { $ne: currentUser._id },
-      },
-      { $addToSet: { readBy: currentUser._id } }
-    );
+    const unreadFilter = {
+      conversation: conversation._id,
+      sender: { $ne: currentUser._id },
+      readBy: { $ne: currentUser._id },
+    };
+    // whose messages are being seen now, so their ticks turn "seen"
+    const seenSenders = await Message.distinct("sender", unreadFilter);
+
+    if (seenSenders.length) {
+      await Message.updateMany(unreadFilter, {
+        $addToSet: { readBy: currentUser._id },
+      });
+
+      const io = getSocketIO(req);
+      for (const senderId of seenSenders) {
+        emitToUser(io, senderId, "chat:messages:read", {
+          conversationId: String(conversation._id),
+          readerId: String(currentUser._id),
+          readerName: currentUser.name || "",
+          readAt: new Date().toISOString(),
+        });
+      }
+    }
 
     const messages = await Message.find({
       conversation: conversation._id,
