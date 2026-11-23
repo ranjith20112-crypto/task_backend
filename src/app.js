@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import express from "express";
 import http from "http";
 import cors from "cors";
@@ -8,6 +9,7 @@ import { fileURLToPath } from "url";
 import { Server } from "socket.io";
 
 import authRoutes from "./routes/authRoutes.js";
+import taskEmailRoutes from "./routes/taskEmailRoutes.js";
 import userRoutes from "./routes/userRoutes.js";
 import departmentRoutes from "./routes/departmentRoutes.js";
 import taskRoutes from "./routes/taskRoutes.js";
@@ -21,7 +23,9 @@ import permissionRoutes from "./routes/permissionRoutes.js";
 import notificationRoutes from "./routes/notificationRoutes.js";
 import pushRoutes from "./routes/pushRoutes.js";
 import customRoleRoutes from "./routes/customRoleRoutes.js";
-import apiKeyRoutes from "./routes/apiKeyRoutes.js";
+import telegramRoutes from "./routes/telegramRoutes.js";
+import activityRoutes from "./routes/activityRoutes.js";
+import { trackActivity } from "./services/activityService.js";
 import { getConnectUrl, oauthCallback } from "./controllers/googleConnectController.js";
 import { authorize } from "./middleware/role.js";
 
@@ -31,51 +35,95 @@ import { attachOrgUsers } from "./middleware/orgScope.js";
 import { attachPermissions, permissionByMethod, requirePermission } from "./middleware/permissionMiddleware.js";
 import { registerChatSocket } from "./socket/Chatsocket.js";
 import { setRealtimeIO } from "./socket/realtime.js";
+import { registerMeetingSocket } from "./socket/meetingSocket.js";
+import { PRODUCTION_FRONTEND_URL, HOSTINGER_FRONTEND_URL } from "./config/urls.js";
 
 dotenv.config();
 
 export const app = express();
 export const server = http.createServer(app);
 
+// Render (and most hosts) put a proxy in front: trust it so req.ip / https are the real ones
+app.set("trust proxy", 1);
+
 // ⭐ Required for ESM — used to resolve the uploads directory path
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Frontends allowed to call this API: FRONTEND_URL + CORS_ORIGINS (comma separated) from .env,
+// plus the local dev servers.
 const allowedOrigins = [
-  "http:localhost:3000",
-  "http://localhost:5173",
-  "https://task-frontend-zeta-five.vercel.app",
+  ...new Set(
+    [
+      process.env.FRONTEND_URL,
+      PRODUCTION_FRONTEND_URL, // https://blizz-board-frontend.vercel.app
+      HOSTINGER_FRONTEND_URL, // https://tempered-mediumaquamarine-swan-77.hostingersite.com
+      ...String(process.env.CORS_ORIGINS || "").split(","),
+      "http://localhost:3000",
+      "http://localhost:5173",
+    ]
+      .map((o) => String(o || "").trim().replace(/\/+$/, ""))
+      .filter(Boolean)
+  ),
 ];
+
+// Same decision for REST and Socket.IO. A refused origin is logged once, so a wrong
+// FRONTEND_URL is visible in the Render logs instead of failing silently in the browser.
+const refusedOrigins = new Set();
+const checkOrigin = (origin, callback) => {
+  // no Origin header = server-to-server, curl, health checks → allowed (CORS is a browser rule)
+  if (!origin || allowedOrigins.includes(origin.replace(/\/+$/, ""))) return callback(null, true);
+  if (!refusedOrigins.has(origin)) {
+    refusedOrigins.add(origin);
+    console.warn(`CORS: refused origin ${origin} — allowed: ${allowedOrigins.join(", ")}`);
+  }
+  return callback(null, false);
+};
 
 // ==================== SOCKET.IO ====================
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins,
+    origin: checkOrigin,
     methods: ["GET", "POST"],
     credentials: true,
   },
 });
 
 registerChatSocket(io);
+registerMeetingSocket(io); // WebRTC signaling for MoM video calls
 app.set("io", io);
 setRealtimeIO(io); // real-time notifications (task assigned, status changes, tickets…)
 
 // ==================== MIDDLEWARE ====================
 app.use(
   cors({
-    origin: allowedOrigins,
+    origin: checkOrigin,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-API-Key"],
+    allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true,
   })
 );
 
-app.use(express.json({ limit: "3mb" })); // MoM transcripts can be large
+app.use(express.json({ limit: "3mb" }));
 app.use(express.urlencoded({ extended: true }));
 if (process.env.NODE_ENV !== "test") app.use(morgan("dev"));
 
 // 🔒 Task attachments are NOT served statically any more (that made every file public).
 // Download them through the authenticated, scope-checked endpoint:
 //   GET /api/tasks/attachments/:filename
+
+// ==================== HEALTH ====================
+// Cheap and public: the login page calls it to wake a sleeping Render instance while the
+// user types, and it reports whether MongoDB is connected (1 = connected).
+app.get("/api/health", (req, res) => {
+  const db = mongoose.connection.readyState;
+  res.set("Cache-Control", "no-store");
+  res.status(db === 1 ? 200 : 503).json({
+    success: db === 1,
+    status: db === 1 ? "ok" : "database-unavailable",
+    db,
+    uptime: Math.round(process.uptime()),
+  });
+});
 
 // ==================== PUBLIC ROUTES ====================
 app.get("/", (req, res) => {
@@ -95,25 +143,30 @@ app.get("/", (req, res) => {
       reports: "/api/reports",
       support: "/api/support",
       permissions: "/api/permissions",
-      apiKeys: "/api/api-keys",
     },
   });
 });
 
 app.use("/api/auth", authRoutes);
+// Public: task page opened from the assignment email (signed link, no login)
+app.use("/api/task-email", taskEmailRoutes);
 
 // Google reconnect: Google sends the browser back here (must match GOOGLE_REDIRECT_URI)
 app.get("/oauth2callback", oauthCallback);
 
 // ==================== PROTECTED ROUTES ====================
 // Every protected request: authenticate → data scope → effective permissions
-const protect = [authenticate, attachScope, attachPermissions];
+const protect = [authenticate, attachScope, attachPermissions, trackActivity];
+
+// Activity: pages opened / logout (everyone); Activity page (Admin / SuperAdmin)
+app.use("/api/activity", ...protect, activityRoutes);
 
 app.use("/api/permissions", ...protect, permissionRoutes);
 app.use("/api/notifications", ...protect, notificationRoutes);
 app.use("/api/push", ...protect, pushRoutes);
 app.use("/api/custom-roles", ...protect, customRoleRoutes);
-app.use("/api/api-keys", ...protect, apiKeyRoutes);
+// Telegram bot: connect / disconnect my account (any logged-in user)
+app.use("/api/telegram", ...protect, telegramRoutes);
 app.post("/api/google/connect-url", ...protect, authorize("Admin", "SuperAdmin"), getConnectUrl);
 app.use("/api/departments", ...protect, departmentRoutes);
 app.use("/api/tasks", ...protect, taskRoutes);
@@ -155,3 +208,13 @@ app.use((err, req, res, next) => {
 });
 
 export default app;
+
+// Some hosts (Hostinger's Node.js apps) start src/app.js instead of src/server.js.
+// Then start the real server from here. When server.js is the entry it imports this file;
+// importing server.js again returns that same module, so the server never starts twice.
+if (process.env.NODE_ENV !== "test" && !globalThis.__blizzServerStart) {
+  globalThis.__blizzServerStart = import("./server.js").catch((err) => {
+    console.error("❌ Server failed to start:", err);
+    process.exit(1);
+  });
+}
