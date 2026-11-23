@@ -21,6 +21,7 @@ import permissionRoutes from "./routes/permissionRoutes.js";
 import notificationRoutes from "./routes/notificationRoutes.js";
 import pushRoutes from "./routes/pushRoutes.js";
 import customRoleRoutes from "./routes/customRoleRoutes.js";
+import apiKeyRoutes from "./routes/apiKeyRoutes.js";
 import { getConnectUrl, oauthCallback } from "./controllers/googleConnectController.js";
 import { authorize } from "./middleware/role.js";
 
@@ -63,7 +64,7 @@ app.use(
   cors({
     origin: allowedOrigins,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-API-Key"],
     credentials: true,
   })
 );
@@ -94,6 +95,7 @@ app.get("/", (req, res) => {
       reports: "/api/reports",
       support: "/api/support",
       permissions: "/api/permissions",
+      apiKeys: "/api/api-keys",
     },
   });
 });
@@ -111,6 +113,7 @@ app.use("/api/permissions", ...protect, permissionRoutes);
 app.use("/api/notifications", ...protect, notificationRoutes);
 app.use("/api/push", ...protect, pushRoutes);
 app.use("/api/custom-roles", ...protect, customRoleRoutes);
+app.use("/api/api-keys", ...protect, apiKeyRoutes);
 app.post("/api/google/connect-url", ...protect, authorize("Admin", "SuperAdmin"), getConnectUrl);
 app.use("/api/departments", ...protect, departmentRoutes);
 app.use("/api/tasks", ...protect, taskRoutes);
