@@ -9,7 +9,8 @@
     "seed": "node src/utils/seedSuperAdmin.js",
     "test": "node --test --test-concurrency=1 tests/",
     "migrate:org": "node src/scripts/migrateOrgMembership.js",
-    "google:token": "node src/scripts/getGoogleRefreshToken.js"
+    "google:token": "node src/scripts/getGoogleRefreshToken.js",
+    "apikey:create": "node src/scripts/createApiKey.js"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.7.5",
